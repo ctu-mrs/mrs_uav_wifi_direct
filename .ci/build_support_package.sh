@@ -622,10 +622,7 @@ Provides: libmsquic (= $MSQUIC_VERSION), mrs-libmsquic (= $wifi_version)
 Conflicts: libmsquic, libmsquic-debug, mrs-libmsquic
 Replaces: libmsquic, libmsquic-debug, mrs-libmsquic
 Homepage: https://github.com/ctu-mrs/mrs_uav_wifi_direct
-Description: Wi-Fi Direct and QUIC support for MRS UAVs
- Wi-Fi Direct supplicant support, MsQuic library and headers, and DKMS sources
- for concurrent hosting on supported Intel radios. DKMS rebuilds the module
- for kernel updates. Installation and removal preserve the running Wi-Fi link.
+Description: Wi-Fi Direct and QUIC support for MRS UAV System
 CONTROL
 printf 'libmsquic 2 %s (>= %s)\n' "$SUPPORT_PACKAGE" "$wifi_version" >"$wifi_root/DEBIAN/shlibs"
 printf 'activate-noawait ldconfig\n' >"$wifi_root/DEBIAN/triggers"
