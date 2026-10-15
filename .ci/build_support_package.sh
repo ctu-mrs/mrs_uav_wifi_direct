@@ -8,7 +8,7 @@ umask 022
 
 wifi_arch=$(dpkg --print-architecture)
 wifi_multiarch=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
-wifi_version=${MSQUIC_VERSION}-mrs8
+wifi_version=${MSQUIC_VERSION}-mrs9
 wifi_ci=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 wifi_output=${1:?Usage: .ci/build_support_package.sh ARTIFACTS_FOLDER}
 wifi_jobs=${MRS_BUILD_JOBS:-$(nproc)}
@@ -226,8 +226,8 @@ REFRESH
 chmod 755 "$wifi_dkms/"*.sh
 
 # Build the distribution supplicant with the P2P patch and its normal features.
-# Its exact package dependency keeps this replacement paired with that release.
-wifi_wpa_version=$(dpkg-query -W -f='${Version}' wpasupplicant)
+# The distribution package supplies service files. The bundled executable's
+# library requirements are calculated below by dpkg-shlibdeps.
 wifi_wpa_source_version=$(dpkg-query -W -f='${source:Version}' wpasupplicant)
 source "$wifi_dkms/source.sh"
 fetch_source wpa "$wifi_wpa_source_version" "$wifi_work/wpa"
@@ -617,7 +617,7 @@ Maintainer: Vojtech Vrba <vrba.vojtech@fel.cvut.cz>
 Depends: $wifi_depends, dkms, dpkg-dev, make, gcc, binutils, patch, kmod,
  libelf-dev, mokutil, openssl, initramfs-tools, linux-firmware, wireless-regdb,
  iw, iproute2, systemd, passwd,
- wpasupplicant (= $wifi_wpa_version), $wifi_headers
+ wpasupplicant, $wifi_headers
 Provides: libmsquic (= $MSQUIC_VERSION), mrs-libmsquic (= $wifi_version)
 Conflicts: libmsquic, libmsquic-debug, mrs-libmsquic
 Replaces: libmsquic, libmsquic-debug, mrs-libmsquic
