@@ -1,0 +1,12 @@
+build/
+install/
+log/
+__pycache__/
+*.pyc
+*.key
+*.crt
+*.srl
+*.deb
+test/
+scripts/
+.ruff_cache/

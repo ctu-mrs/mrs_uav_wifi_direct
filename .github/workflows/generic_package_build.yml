@@ -1,0 +1,27 @@
+name: generic_package_build
+
+on:
+
+  push:
+    branches: [ ros2 ]
+
+    paths-ignore:
+      - '**/README.md'
+
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+
+  build_amd64:
+    uses: ctu-mrs/ci_scripts/.github/workflows/generic_package_build_amd64.yml@ros2
+    secrets:
+      PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}
+
+  build_arm64:
+    uses: ctu-mrs/ci_scripts/.github/workflows/generic_package_build_arm64.yml@ros2
+    secrets:
+      PUSH_TOKEN: ${{ secrets.PUSH_TOKEN }}

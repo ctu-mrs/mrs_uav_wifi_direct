@@ -1,0 +1,22 @@
+<?xml version="1.0"?>
+<package format="3">
+	<name>mrs_uav_wifi_direct</name>
+	<version>0.1.0</version>
+	<description>Share ROS 2 topics between MRS UAVs over Wi-Fi Direct and QUIC.</description>
+	<maintainer email="vrba.vojtech@fel.cvut.cz">Vojtech Vrba</maintainer>
+	<license>BSD-3-Clause</license>
+	<buildtool_depend>ament_cmake</buildtool_depend>
+	<depend>rclcpp</depend>
+	<depend>yaml-cpp</depend>
+	<depend>openssl</depend>
+	<build_depend>pkg-config</build_depend>
+	<depend>mrs-uav-wifi-direct-support</depend>
+	<exec_depend>launch</exec_depend>
+	<exec_depend>launch_ros</exec_depend>
+	<exec_depend>nav_msgs</exec_depend>
+	<exec_depend>wpasupplicant</exec_depend>
+	<exec_depend>systemd</exec_depend>
+	<exec_depend>iproute2</exec_depend>
+	<exec_depend>iw</exec_depend>
+	<export><build_type>ament_cmake</build_type></export>
+</package>

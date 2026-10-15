@@ -1,0 +1,109 @@
+# UAVs allowed to exchange topics, including this UAV.
+# Default: [] disables topic sharing, QUIC connections and Wi-Fi Direct management.
+# Allowed: [] or unique names formed by "uav" and a number from 1 to 99.
+# A leading zero is allowed for single-digit numbers.
+uav_list: []
+
+# Addresses are read from each host interface's network settings.
+network:
+  # Port on which QUIC accepts connections. Default: 4567.
+  # Allowed: 1..65535; with port_per_uav, leave room for the largest UAV number.
+  port: 4567
+  # Add the UAV number to port, for multiple nodes on one host. Default: false.
+  # Allowed: true or false.
+  port_per_uav: false
+  # Keep a QUIC connection through the AP while it is available. Default: true.
+  # Allowed: true or false; at least AP or Wi-Fi Direct must be enabled.
+  ap_enabled: true
+  # Send topics through the AP when the direct link is unavailable. Default: true.
+  # Allowed: true or false; requires ap_enabled to have an effect.
+  ap_fallback: true
+  # Packet priority requested for direct traffic. Default: 8 (CS1/background).
+  # Allowed: 0..63; 0 requests normal priority. Driver handling may vary.
+  direct_dscp: 8
+  # Largest serialized ROS message, in bytes. Default: 8388608 (8 MiB).
+  # Allowed: 4..67108864 (64 MiB). QUIC splits large messages into packets.
+  max_message_bytes: 8388608
+  # Send-buffer limit per stream and total ROS receive-queue limit, in bytes.
+  # Default: 16777216 (16 MiB).
+  # Allowed: max_message_bytes + 65536 through 1073741824 (1 GiB).
+  # Samples are dropped when a queue reaches this limit.
+  max_pending_bytes: 16777216
+
+# Certificates identify the UAVs and encrypt their connections.
+tls:
+  # Directory for this UAV's identity and remembered peer certificates.
+  # Default: ~/.ros/mrs_uav_wifi_direct/{hostname}.
+  # Allowed: a nonempty directory path; ~ and {hostname} are expanded.
+  # Keep this directory between restarts and upgrades.
+  identity_directory: "~/.ros/mrs_uav_wifi_direct/{hostname}"
+  # Local PEM certificate. Default: "" creates/reuses <hostname>.crt automatically.
+  # Allowed: "" or an existing PEM file path, paired with private_key.
+  certificate: ""
+  # Local PEM private key. Default: "" creates/reuses <hostname>.key automatically.
+  # Allowed: "" or an existing PEM file path, paired with certificate.
+  private_key: ""
+  # Certificate authority used to verify peers. Default: "" remembers each peer's
+  # first certificate; make that first connection on a trusted network.
+  # Allowed: "" or an existing CA PEM file. With a CA, supply the local certificate
+  # and private key, or place them at their default paths before starting the node.
+  ca_certificate: ""
+
+# One group connects the participating UAVs directly over Wi-Fi.
+wifi_direct:
+  # Create/join a group, or use existing_group_interface. Default: true.
+  # Allowed: true or false; at least AP or Wi-Fi Direct must be enabled.
+  enabled: true
+  # Primary Wi-Fi interface. Default: wlan0.
+  # Allowed: an existing managed wireless interface name.
+  interface: "wlan0"
+  # Directory containing the existing wpa_supplicant control sockets.
+  # Default: /run/wpa_supplicant. Allowed: an accessible socket-directory path.
+  control_directory: "/run/wpa_supplicant"
+  # Socket used for P2P commands. Default: "" selects p2p-dev-<interface> when
+  # present, or the primary interface otherwise. Allowed: "" or an existing socket name.
+  control_interface: ""
+  # Time to discover peers before choosing an owner, in seconds. Default: 30.
+  # Allowed: 1..60.
+  election_settle_s: 30
+  # Time before a silent peer is considered unavailable, in seconds. Default: 12.
+  # Allowed: 3..120. Heartbeats use the receiving host's clock.
+  peer_timeout_s: 12
+  # Time a new owner choice must remain stable, in seconds. Default: 5.
+  # Allowed: 1..30.
+  switch_hold_s: 5
+  # Wait before this UAV retries hosting after a failure, in seconds. Default: 60.
+  # Allowed: 10..600.
+  host_cooldown_s: 60
+  # Time to wait for the host to assign a P2P address, in seconds. Default: 15.
+  # Allowed: 1..120. The support package creates the address profile.
+  address_timeout_s: 15
+  # Group interface managed by another program. Default: "" manages a group here.
+  # Allowed: "" or an existing, addressed P2P interface name.
+  existing_group_interface: ""
+
+# Received topics appear at <prefix>/<sending UAV>/<topic key>.
+# Default: /{hostname}/quic/peers.
+# Allowed: a valid ROS topic prefix, excluding "" and "/"; {hostname} is expanded.
+receive_prefix: "/{hostname}/quic/peers"
+
+# Default in this file: the odometry entry below. Omit this list, or use [],
+# to exchange fleet status only. Allowed: up to 1024 entries with unique keys.
+shared_topics:
+  # Name identifying this topic on every UAV. Default example: odometry; required.
+  # Allowed: a letter or underscore, then letters, digits or underscores; up to 1024 characters.
+  - key: odometry
+    # Local source topic. Default example: /{hostname}/estimation_manager/odom_main; required.
+    # Allowed: a valid ROS topic name outside receive_prefix; {hostname} is expanded.
+    topic: "/{hostname}/estimation_manager/odom_main"
+    # ROS message type. Default example: nav_msgs/msg/Odometry; required.
+    # Allowed: an installed package/msg/Type name, up to 1024 characters.
+    message_type: "nav_msgs/msg/Odometry"
+    # Maximum sending rate in Hz. Default in this file: 10.0; omitted: 0.
+    # Allowed: 0 (every new sample), or a positive rate up to 1000000.
+    # A positive rate sends the latest sample; its period must fit signed 64-bit nanoseconds.
+    rate_hz: 10.0
+    # ROS subscription reliability. Default: best_effort.
+    # Allowed: best_effort or reliable. A reliable subscription requires a reliable
+    # source publisher; best_effort accepts either publisher setting.
+    reliability: "best_effort"

@@ -1,0 +1,198 @@
+--- a/wpa_supplicant/p2p_supplicant.c
++++ b/wpa_supplicant/p2p_supplicant.c
+@@ -3572,6 +3572,44 @@
+ }
+ 
+ 
++/* MRS: only an associated infrastructure AP can authorize this P2P context. */
++static int mrs_concurrent_go_bandwidth(struct wpa_global *global, int freq, int bandwidth) {
++	struct wpa_supplicant *station;
++	for (station = global->ifaces; station; station = station->next) {
++		const u8 *ht, *vht;
++		int center, width = 20;
++		if (station->wpa_state != WPA_COMPLETED || !station->current_ssid ||
++			station->current_ssid->mode != WPAS_MODE_INFRA ||
++			station->current_ssid->p2p_group || !station->current_bss ||
++			wpa_bss_get_vendor_ie(station->current_bss, P2P_IE_VENDOR_TYPE))
++			continue;
++		center = station->assoc_freq;
++		ht = wpa_bss_get_ie(station->current_bss, WLAN_EID_HT_OPERATION);
++		if (ht && ht[1] >= 2 && (ht[3] & 4)) {
++			if ((ht[3] & 3) == 1) { width = 40; center += 10; }
++			else if ((ht[3] & 3) == 3) { width = 40; center -= 10; }
++		}
++		vht = wpa_bss_get_ie(station->current_bss, WLAN_EID_VHT_OPERATION);
++		if (vht && vht[1] >= 5 && station->assoc_freq >= 5000 && station->assoc_freq < 5900) {
++			if (vht[2] == 1) {
++				width = 80; center = 5000 + 5 * vht[3];
++				if (vht[4]) {
++					if (abs((int)vht[4] - vht[3]) != 8) continue;
++					width = 160; center = 5000 + 5 * vht[4];
++				}
++			} else if (vht[2] == 2) { width = 160; center = 5000 + 5 * vht[3]; }
++			else if (vht[2] > 2) continue;
++		}
++		if (width >= bandwidth && freq >= center - width / 2 + 10 && freq <= center + width / 2 - 10)
++			return 1;
++	}
++	return 0;
++}
++
++int wpas_mrs_concurrent_go_channel(struct wpa_global *global, int freq) {
++	return mrs_concurrent_go_bandwidth(global, freq, 20);
++}
++
+ static enum chan_allowed has_channel(struct wpa_global *global,
+ 				     struct hostapd_hw_modes *mode, u8 op_class,
+ 				     u8 chan, int *flags)
+@@ -3585,12 +3623,31 @@
+ 
+ 	for (i = 0; i < mode->num_channels; i++) {
+ 		if ((unsigned int) mode->channels[i].freq == freq) {
+-			if (flags)
++			if (flags) {
+ 				*flags = mode->channels[i].flag;
++				if (mode->mode == HOSTAPD_MODE_IEEE80211A &&
++					(mode->channels[i].flag & HOSTAPD_CHAN_GO_CONCURRENT) &&
++					!(mode->channels[i].flag & (HOSTAPD_CHAN_DISABLED | HOSTAPD_CHAN_RADAR))) {
++					if ((mode->channels[i].allowed_bw & HOSTAPD_CHAN_WIDTH_80) &&
++						mrs_concurrent_go_bandwidth(global, freq, 80))
++						*flags |= HOSTAPD_CHAN_VHT_10_70 | HOSTAPD_CHAN_VHT_30_50 |
++							HOSTAPD_CHAN_VHT_50_30 | HOSTAPD_CHAN_VHT_70_10;
++					if ((mode->channels[i].allowed_bw & HOSTAPD_CHAN_WIDTH_160) &&
++						mrs_concurrent_go_bandwidth(global, freq, 160))
++						*flags |= HOSTAPD_CHAN_VHT_10_150 | HOSTAPD_CHAN_VHT_30_130 |
++							HOSTAPD_CHAN_VHT_50_110 | HOSTAPD_CHAN_VHT_70_90 |
++							HOSTAPD_CHAN_VHT_90_70 | HOSTAPD_CHAN_VHT_110_50 |
++							HOSTAPD_CHAN_VHT_130_30 | HOSTAPD_CHAN_VHT_150_10;
++				}
++			}
+ 			if (mode->channels[i].flag & HOSTAPD_CHAN_DISABLED)
+ 				return NOT_ALLOWED;
+-			if (mode->channels[i].flag & HOSTAPD_CHAN_NO_IR)
+-				return NO_IR;
++			if (mode->channels[i].flag & HOSTAPD_CHAN_NO_IR) {
++				if (!(mode->channels[i].flag & HOSTAPD_CHAN_GO_CONCURRENT) ||
++					(mode->channels[i].flag & HOSTAPD_CHAN_RADAR) ||
++					!wpas_mrs_concurrent_go_channel(global, freq))
++					return NO_IR;
++			}
+ 			if (mode->channels[i].flag & HOSTAPD_CHAN_RADAR)
+ 				return RADAR;
+ 			return ALLOWED;
+--- a/wpa_supplicant/p2p_supplicant.h
++++ b/wpa_supplicant/p2p_supplicant.h
+@@ -8,6 +8,9 @@
+ 
+ #ifndef P2P_SUPPLICANT_H
+ #define P2P_SUPPLICANT_H
++
++struct wpa_global;
++int wpas_mrs_concurrent_go_channel(struct wpa_global *global, int freq);
+ 
+ enum p2p_wps_method;
+ struct p2p_go_neg_results;
+--- a/src/ap/hostapd.h
++++ b/src/ap/hostapd.h
+@@ -448,6 +448,8 @@
+ struct hostapd_iface {
+ 	struct hapd_interfaces *interfaces;
+ 	void *owner;
++	/* Optional supplicant authorization for a concurrent P2P GO. */
++	int (*mrs_concurrent_go_channel)(void *owner, int frequency);
+ 	char *config_fname;
+ 	struct hostapd_config *conf;
+ 	char phy[16]; /* Name of the PHY (radio) */
+--- a/wpa_supplicant/ap.c
++++ b/wpa_supplicant/ap.c
+@@ -922,6 +922,18 @@
+ }
+ 
+ 
++#ifdef CONFIG_P2P
++/* Only a P2P GO may use an existing infrastructure AP's occupied channels. */
++static int mrs_ap_concurrent_go_channel(void *context, int frequency) {
++	struct wpa_supplicant *group = context;
++	if (!group || !group->current_ssid || !group->current_ssid->p2p_group ||
++		(group->current_ssid->mode != WPAS_MODE_P2P_GO &&
++		 group->current_ssid->mode != WPAS_MODE_P2P_GROUP_FORMATION))
++		return 0;
++	return wpas_mrs_concurrent_go_channel(group->global, frequency);
++}
++#endif /* CONFIG_P2P */
++
+ int wpa_supplicant_create_ap(struct wpa_supplicant *wpa_s,
+ 			     struct wpa_ssid *ssid)
+ {
+@@ -1021,6 +1033,9 @@
+ 	if (hapd_iface == NULL)
+ 		return -1;
+ 	hapd_iface->owner = wpa_s;
++#ifdef CONFIG_P2P
++	hapd_iface->mrs_concurrent_go_channel = mrs_ap_concurrent_go_channel;
++#endif
+ 	hapd_iface->drv_flags = wpa_s->drv_flags;
+ 	hapd_iface->probe_resp_offloads = wpa_s->probe_resp_offloads;
+ 	hapd_iface->extended_capa = wpa_s->extended_capa;
+--- a/src/ap/hw_features.c
++++ b/src/ap/hw_features.c
+@@ -72,6 +72,20 @@
+ #endif /* CONFIG_NO_STDOUT_DEBUG */
+ 
+ 
++/* Preserve disabled/radar restrictions and the kernel's final regulatory check. */
++static int mrs_ap_permitted_no_ir(struct hostapd_iface *iface,
++	const struct hostapd_channel_data *channel) {
++#ifdef CONFIG_P2P
++	return iface->mrs_concurrent_go_channel &&
++		(iface->bss[0]->conf->p2p & P2P_GROUP_OWNER) &&
++		(channel->flag & HOSTAPD_CHAN_GO_CONCURRENT) &&
++		!(channel->flag & (HOSTAPD_CHAN_DISABLED | HOSTAPD_CHAN_RADAR)) &&
++		iface->mrs_concurrent_go_channel(iface->owner, channel->freq);
++#else
++	return 0;
++#endif /* CONFIG_P2P */
++}
++
+ int hostapd_get_hw_features(struct hostapd_iface *iface)
+ {
+ 	struct hostapd_data *hapd = iface->bss[0];
+@@ -122,8 +136,9 @@
+ 				     HOSTAPD_CHAN_RADAR) &&
+ 				    !(iface->drv_flags &
+ 				      WPA_DRIVER_FLAGS_DFS_OFFLOAD)) ||
+-				   (feature->channels[j].flag &
+-				    HOSTAPD_CHAN_NO_IR)) {
++				   ((feature->channels[j].flag &
++				     HOSTAPD_CHAN_NO_IR) &&
++				    !mrs_ap_permitted_no_ir(iface, &feature->channels[j]))) {
+ 				feature->channels[j].flag |=
+ 					HOSTAPD_CHAN_DISABLED;
+ 			}
+--- a/src/ap/ieee802_11.c
++++ b/src/ap/ieee802_11.c
+@@ -4477,6 +4477,12 @@
+ 		return WLAN_STATUS_UNSPECIFIED_FAILURE;
+ 	}
+ 
++#ifdef CONFIG_P2P
++	/* MRS P2P owners accept P2P clients only; normal AP associations are unchanged. */
++	if ((hapd->conf->p2p & P2P_GROUP_OWNER) && !elems.p2p)
++		return WLAN_STATUS_UNSPECIFIED_FAILURE;
++#endif /* CONFIG_P2P */
++
+ 	resp = check_ssid(hapd, sta, elems.ssid, elems.ssid_len);
+ 	if (resp != WLAN_STATUS_SUCCESS)
+ 		return resp;
+--- a/wpa_supplicant/ctrl_iface.c
++++ b/wpa_supplicant/ctrl_iface.c
+@@ -944,6 +944,9 @@
+ 
+ 	wpa_printf(MSG_DEBUG, "CTRL_IFACE GET '%s'", cmd);
+ 
++	if (os_strcmp(cmd, "mrs_wifi_direct_radio_support") == 0)
++		return os_snprintf(buf, buflen, "3");
++
+ 	if (os_strcmp(cmd, "version") == 0) {
+ 		res = os_snprintf(buf, buflen, "%s", VERSION_STR);
+ 	} else if (os_strcasecmp(cmd, "max_command_len") == 0) {
