@@ -8,7 +8,7 @@ umask 022
 
 wifi_arch=$(dpkg --print-architecture)
 wifi_multiarch=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
-wifi_version=${MSQUIC_VERSION}-mrs9
+wifi_version=${MSQUIC_VERSION}-mrs10
 wifi_ci=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 wifi_output=${1:?Usage: .ci/build_support_package.sh ARTIFACTS_FOLDER}
 wifi_jobs=${MRS_BUILD_JOBS:-$(nproc)}
@@ -114,9 +114,14 @@ wifi_needed=false
 for wifi_driver in /sys/class/net/*/device/driver; do
 	[[ $(basename "$(readlink -f "$wifi_driver")") != iwlwifi ]] || wifi_needed=true
 done
-if [[ $wifi_needed == false ]] || ! grep -qx 'CONFIG_CFG80211=m' "$kernel_source_dir/.config" ||
-	grep -qx 'CONFIG_CFG80211_REG_RELAX_NO_IR=y' "$kernel_source_dir/.config"; then
+if [[ $wifi_needed == false || ! -f $kernel_source_dir/.config ]] ||
+	! grep -qx 'CONFIG_CFG80211=m' "$kernel_source_dir/.config" ||
+	grep -qx 'CONFIG_CFG80211_REG_RELAX_NO_IR=y' "$kernel_source_dir/.config" ||
+	[[ $kernelver != "$(uname -r)" && ! -e /boot/vmlinuz-$kernelver ]]; then
 	BUILD_EXCLUSIVE_KERNEL='a^'
+	# DKMS checks AUTOINSTALL before trying a build. Empty also works with
+	# versions that treat any nonempty value, including "no", as enabled.
+	AUTOINSTALL=""
 fi
 DKMS
 sed -i "s/@VERSION@/$wifi_version/g" "$wifi_dkms/dkms.conf"
@@ -248,10 +253,6 @@ cat >"$wifi_root/DEBIAN/preinst" <<'PREINST'
 set -euo pipefail
 case ${1:-} in
 	install | upgrade)
-		# The old support package recorded its files for safe removal during migration.
-		if [[ -x /usr/lib/mrs-uav-wifi-direct/radio-support ]]; then
-			/usr/lib/mrs-uav-wifi-direct/radio-support --remove-all
-		fi
 		dpkg-divert --package mrs-uav-wifi-direct-support --add --rename --divert /usr/sbin/wpa_supplicant.distrib /usr/sbin/wpa_supplicant
 		;;
 esac
@@ -260,13 +261,52 @@ cat >"$wifi_root/DEBIAN/postinst" <<'POSTINST'
 #!/usr/bin/env bash
 set -euo pipefail
 [[ ${1:-} == configure ]] || exit 0
-wifi_name=mrs-uav-wifi-direct-support
-wifi_version=@VERSION@
-if ! dkms status -m "$wifi_name" -v "$wifi_version" | grep -q .; then dkms add -m "$wifi_name" -v "$wifi_version"; fi
-for wifi_path in /lib/modules/*; do
-	[[ -f $wifi_path/build/Module.symvers ]] || continue
-	dkms autoinstall -m "$wifi_name" -v "$wifi_version" -k "${wifi_path##*/}"
-done
+# Prepare this package's module without changing other DKMS drivers.
+prepare_kernel_modules() (
+	if [[ -f /etc/dkms/no-autoinstall ]]; then
+		printf 'Automatic DKMS installation is disabled by the administrator.\n'
+		exit 0
+	fi
+	wifi_name=mrs-uav-wifi-direct-support
+	wifi_version=@VERSION@
+	wifi_source=/usr/src/$wifi_name-$wifi_version
+	wifi_current=$(uname -r)
+	wifi_kernels=()
+	if ! dkms status -m "$wifi_name" -v "$wifi_version" | grep -q .; then dkms add -m "$wifi_name" -v "$wifi_version"; fi
+	# Header packages can outlive their kernel images. Prepare the running kernel
+	# and newest installed image, following the usual DKMS installation policy.
+	for wifi_path in /lib/modules/*; do
+		wifi_kernel=${wifi_path##*/}
+		[[ $wifi_kernel == "$wifi_current" || -e /boot/vmlinuz-$wifi_kernel ]] || continue
+		wifi_kernels+=("$wifi_kernel")
+	done
+	wifi_latest=$(printf '%s\n' "${wifi_kernels[@]}" | sort -V | tail -n 1)
+	wifi_targets=("$wifi_current")
+	if [[ -n $wifi_latest && $wifi_latest != "$wifi_current" ]]; then wifi_targets+=("$wifi_latest"); fi
+	for wifi_kernel in "${wifi_targets[@]}"; do
+		if [[ ! -f /lib/modules/$wifi_kernel/build/Module.symvers ]]; then
+			printf 'Kernel %s: module build deferred until its headers are installed.\n' "$wifi_kernel"
+			continue
+		fi
+		# Reuse the packaged eligibility check before invoking DKMS. This avoids
+		# reporting excluded radios/kernels as failed builds during installation.
+		if ! (
+			kernelver=$wifi_kernel
+			kernel_source_dir=/lib/modules/$wifi_kernel/build
+			dkms_tree=/var/lib/dkms
+			arch=$(uname -m)
+			source "$wifi_source/dkms.conf"
+			[[ -n $AUTOINSTALL ]]
+		); then
+			printf 'Kernel %s uses the distribution Wi-Fi module.\n' "$wifi_kernel"
+			continue
+		fi
+		# install builds this module when needed; autoinstall also processes other
+		# registered modules, even when -m and -v are supplied in DKMS 3.0.
+		dkms install -m "$wifi_name" -v "$wifi_version" -k "$wifi_kernel"
+	done
+)
+prepare_kernel_modules
 # Configure the existing Wi-Fi services once for the local UAV user.
 setup_wifi() (
 set -euo pipefail
@@ -482,7 +522,7 @@ fi
 	printf 'Wi-Fi permissions configured. Log out and log in to activate %s membership.\n' "$wifi_group"
 )
 setup_wifi
-printf 'Wi-Fi Direct support installed. New kernel support takes effect at the next reboot.\n'
+printf 'Wi-Fi Direct support installed. Reboot to use the updated Wi-Fi executable and kernel support.\n'
 POSTINST
 cat >"$wifi_root/DEBIAN/prerm" <<'PRERM'
 #!/usr/bin/env bash
@@ -581,9 +621,9 @@ case ${1:-} in
 	*) exit 0 ;;
 esac
 [[ ${1:-} != rollback-setup ]] || exit 0
-while read -r wifi_version; do
-	[[ -z $wifi_version ]] || dkms remove -m mrs-uav-wifi-direct-support -v "$wifi_version" --all
-done < <(dkms status -m mrs-uav-wifi-direct-support | awk -F'[/,:]' '{print $2}' | sort -u)
+if [[ -d /var/lib/dkms/mrs-uav-wifi-direct-support/@VERSION@ ]]; then
+	dkms remove -m mrs-uav-wifi-direct-support -v @VERSION@ --all
+fi
 PRERM
 cat >"$wifi_root/DEBIAN/postrm" <<'POSTRM'
 #!/usr/bin/env bash
@@ -594,7 +634,7 @@ case ${1:-} in
 		;;
 esac
 POSTRM
-sed -i "s/@VERSION@/$wifi_version/g" "$wifi_root/DEBIAN/postinst"
+sed -i "s/@VERSION@/$wifi_version/g" "$wifi_root/DEBIAN/"{postinst,prerm}
 chmod 755 "$wifi_root/DEBIAN/"{preinst,postinst,prerm,postrm}
 
 # Resolve library dependencies from the binaries included in this deb.
@@ -618,9 +658,9 @@ Depends: $wifi_depends, dkms, dpkg-dev, make, gcc, binutils, patch, kmod,
  libelf-dev, mokutil, openssl, initramfs-tools, linux-firmware, wireless-regdb,
  iw, iproute2, systemd, passwd,
  wpasupplicant, $wifi_headers
-Provides: libmsquic (= $MSQUIC_VERSION), mrs-libmsquic (= $wifi_version)
-Conflicts: libmsquic, libmsquic-debug, mrs-libmsquic
-Replaces: libmsquic, libmsquic-debug, mrs-libmsquic
+Provides: libmsquic (= $MSQUIC_VERSION)
+Conflicts: libmsquic, libmsquic-debug
+Replaces: libmsquic, libmsquic-debug
 Homepage: https://github.com/ctu-mrs/mrs_uav_wifi_direct
 Description: Wi-Fi Direct and QUIC support for MRS UAV System
 CONTROL
