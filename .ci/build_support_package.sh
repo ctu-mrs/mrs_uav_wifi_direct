@@ -74,10 +74,12 @@ fetch_source() {
 	done
 	for source_file in /etc/apt/sources.list.d/*.sources; do
 		[[ -f $source_file ]] || continue
+		# Ubuntu's introductory comments also mention Types:. Change the field
+		# at the start of a line, preserving comments and repository signing keys.
 		awk 'BEGIN { RS=""; ORS="\n\n" }
 			$0 !~ /(^|\n)Enabled:[ \t]*no/ && $0 !~ /cdrom:/ {
-				if (sub(/Types:[^\n]*/, "Types: deb-src")) print
-			}' "$source_file" >"$work/repos/$(basename "$source_file")"
+				if ($0 ~ /(^|\n)Types:/) print
+			}' "$source_file" | sed 's/^Types:.*/Types: deb-src/' >"$work/repos/$(basename "$source_file")"
 	done
 	apt-get "${options[@]}" update || printf 'Some source repositories are unavailable; trying the authenticated indexes that were downloaded.\n' >&2
 	if ! (cd "$work" && apt-get "${options[@]}" source --download-only --only-source "$package=$version"); then

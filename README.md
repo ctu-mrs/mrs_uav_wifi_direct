@@ -1,3 +1,6 @@
+![ROS Package Build](https://github.com/ctu-mrs/mrs_uav_wifi_direct/actions/workflows/ros_package_build.yml/badge.svg)
+![Generic Package Build](https://github.com/ctu-mrs/mrs_uav_wifi_direct/actions/workflows/generic_package_build.yml/badge.svg)
+
 # MRS UAV Wi-Fi Direct
 
 This package shares ROS 2 topics between UAVs over Wi-Fi. It can use the existing access point (AP) connection and create an additional [Wi-Fi Direct](https://en.wikipedia.org/wiki/Wi-Fi_Direct) (peer-to-peer) connection between the UAVs. The direct connection carries data without going through the AP.
