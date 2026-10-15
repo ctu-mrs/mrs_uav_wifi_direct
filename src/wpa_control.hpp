@@ -23,7 +23,7 @@ namespace mrs_uav_wifi_direct {
 class WpaControl {
 	public:
 	/** @brief Connect to the Wi-Fi service already running on the host. */
-	explicit WpaControl(const std::string& path) {
+	explicit WpaControl(const std::string& path, int timeout_ms = 10000) : timeout_ms_(timeout_ms) {
 		// A private directory prevents socket-path collisions and symlink replacement.
 		std::array<char, 40> pattern{};
 		std::strcpy(pattern.data(), "/tmp/mrs-wifi-XXXXXX");
@@ -58,20 +58,28 @@ class WpaControl {
 	WpaControl(const WpaControl&) = delete;
 	WpaControl& operator=(const WpaControl&) = delete;
 	/**
-	 * @brief Send a command and wait up to ten seconds for its reply.
+	 * @brief Send a command and wait for its configured timeout (ten seconds by default).
 	 * Full-MAC drivers may delay control processing during standalone discovery
 	 * across several bands. These requests run on the radio worker, so waiting
 	 * for a legitimate scan does not block ROS delivery or QUIC maintenance.
 	 */
 	std::string request(const std::string& cmd) {
-		if (::send(fd_, cmd.data(), cmd.size(), 0) < 0) {
+		if (Clock::now() >= deadline_) {
+			throw std::runtime_error("Supplicant observation deadline expired");
+		}
+		if (::send(fd_, cmd.data(), cmd.size(), MSG_DONTWAIT) < 0) {
 			throw std::runtime_error("Supplicant send failed");
 		}
 		std::string result;
-		if (!receive(10000, result)) {
+		const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(deadline_ - Clock::now()).count();
+		if (!receive(static_cast<int>(std::min<int64_t>(timeout_ms_, std::max<int64_t>(0, remaining))), result)) {
 			throw std::runtime_error("Supplicant request timed out: " + cmd);
 		}
 		return result;
+	}
+	/** @brief Bound a series of passive observation queries as well as each individual reply. */
+	void set_deadline(Clock::time_point deadline) {
+		deadline_ = deadline;
 	}
 	/** @brief Require an OK reply and retain the failed operation in the error. */
 	void ok(const std::string& cmd) {
@@ -127,6 +135,8 @@ class WpaControl {
 		}
 	}
 	int fd_{-1};
+	int timeout_ms_;
+	Clock::time_point deadline_{Clock::time_point::max()};
 	std::string directory_, local_;
 };
 

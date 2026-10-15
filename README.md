@@ -27,7 +27,7 @@ Copy the configuration to your home directory:
 cp "$(ros2 pkg prefix mrs_uav_wifi_direct)/share/mrs_uav_wifi_direct/config/default.yaml" ~/mrs_uav_wifi_direct.yaml
 ```
 
-The installed configuration has `uav_list: []`, so the node starts with communication disabled. In your copy, fill this list with the full names of all participating UAVs, including the local one. UAV names consist of `uav` followed by a number from 1 to 99.
+The installed configuration has `uav_list: []`, so the node starts by publishing local radio and discovery information. Topic sharing and Wi-Fi Direct group management begin when the fleet list is filled. In your copy, fill the list with the full names of all participating UAVs, including the local one. UAV names consist of `uav` followed by a number from 1 to 99.
 
 The default shared topic is odometry. Add other topics under `shared_topics` as needed:
 
@@ -50,7 +50,7 @@ Start the node on each UAV (either directly or in a TMUX session):
 ros2 launch mrs_uav_wifi_direct mrs_uav_wifi_direct.launch.py config_path:="$HOME/mrs_uav_wifi_direct.yaml"
 ```
 
-Received topic names follow `/<local UAV>/quic/peers/<sending UAV>/<key>`. [default.yaml](config/default.yaml) explains every setting and its allowed values.
+Received topic names follow `/<local UAV>/wifi_direct/peers/<sending UAV>/<key>`. [default.yaml](config/default.yaml) explains every setting and its allowed values.
 
 ## How the connections work
 
@@ -65,6 +65,12 @@ Addresses come from the host's network settings. Within each subnet, the differe
 Wi-Fi Direct requires radio and driver support for an AP connection and a P2P group at the same time. A single radio shares its airtime between them, so direct traffic and group setup can affect AP latency and throughput. Direct packets request background priority by default. The node manages the group it creates and removes it when stopped. `iw dev` shows the current AP and P2P interfaces; successful node logs include `Connected to ... over Wi-Fi Direct`.
 
 If another network manager already creates the group, set `wifi_direct.existing_group_interface` to that interface. The node will use its assigned address and leave group management to that manager.
+
+## Discovery and status
+
+`/<hostname>/wifi_direct/discovery` publishes a `mrs_uav_wifi_direct/msg/Discovery` snapshot periodically, including with an empty `uav_list`. It contains the local AP signal and link statistics, nearby UAV names and groups, connected peers, QUIC latency, and topic rates and drop counts. The node also prints a compact status report every two seconds. Set `discovery_interval_s` and `status_interval_s` to change these intervals, zero disables status printing.
+
+Measurements come from the running driver and existing Wi-Fi discovery caches. Collection reads these without starting extra scans. Nearby UAVs appear when the host has recently observed their advertisements. Observations expire after `wifi_direct.peer_timeout_s`. Other fleets can appear in discovery, while only configured UAVs exchange topics. Measurement ages help distinguish a new publication from a new radio sample. QUIC library provides latency information, including network queuing and processing delays.
 
 ## Certificates
 

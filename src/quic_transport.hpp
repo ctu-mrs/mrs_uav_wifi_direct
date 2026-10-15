@@ -20,6 +20,7 @@
 #include "certificates.hpp"
 #include "fleet_policy.hpp"
 #include "network_utils.hpp"
+#include "status.hpp"
 
 namespace mrs_uav_wifi_direct {
 /**
@@ -52,6 +53,7 @@ class QuicTransport {
 		Stream* fleet_outgoing{};
 		Stream* fleet_incoming{};
 		FleetObservation observation;
+		PathLatency latency;
 		std::map<std::string, Stream*> outgoing;
 		std::vector<std::unique_ptr<Stream>> streams;
 	};
@@ -257,11 +259,17 @@ class QuicTransport {
 	 */
 	void send(const TopicConfig& topic, const rclcpp::SerializedMessage& message, uint64_t sequence) {
 		const auto& data = message.get_rcl_serialized_message();
+		std::lock_guard<std::recursive_mutex> lock(mutex_);
 		if (data.buffer_length > config_.max_message) {
+			++send_drops_;
+			for (const auto peer : config_.numbers) {
+				if (peer != config_.own) {
+					++exported_[{peer, topic.key}].drops;
+				}
+			}
 			warn("Dropping oversized ROS message on " + topic.key);
 			return;
 		}
-		std::lock_guard<std::recursive_mutex> lock(mutex_);
 		for (const auto peer : config_.numbers) {
 			if (peer == config_.own) {
 				continue;
@@ -282,6 +290,7 @@ class QuicTransport {
 			if (!chosen) {
 				continue;
 			}
+			auto& traffic = exported_[{peer, topic.key}];
 			try {
 				auto& stream = chosen->outgoing[topic.key];
 				if (!stream || !stream->handle) {
@@ -292,8 +301,14 @@ class QuicTransport {
 				append(frame, sequence, 8);
 				append(frame, data.buffer_length, 4);
 				frame.insert(frame.end(), data.buffer, data.buffer + data.buffer_length);
-				queue(*stream, std::move(frame));
+				if (queue(*stream, std::move(frame))) {
+					++traffic.messages;
+				} else {
+					++traffic.drops;
+				}
 			} catch (const std::exception& error) {
+				++traffic.drops;
+				++send_drops_;
 				warn(error.what());
 			}
 		}
@@ -345,6 +360,40 @@ class QuicTransport {
 		return result;
 	}
 
+	/** @brief Snapshot live paths and queue counters without calling MsQuic while logging. */
+	TransportStatus status() {
+		std::lock_guard<std::recursive_mutex> lock(mutex_);
+		TransportStatus result;
+		result.ap = ap_network_;
+		result.direct = direct_network_;
+		result.ap_listening = ap_listener_.handle != nullptr;
+		result.direct_listening = direct_listener_.handle != nullptr;
+		result.peers = fleet_peers();
+		result.exported = exported_;
+		result.receive_drops_by_topic = receive_drops_by_topic_;
+		result.receive_bytes = receive_bytes_;
+		result.receive_messages = received_.size();
+		result.send_drops = send_drops_;
+		result.receive_drops = receive_drops_;
+		for (const auto& connection : connections_) {
+			if (connection->finished) {
+				continue;
+			}
+			if (connection->connected) {
+				auto& peer = result.connected[connection->peer];
+				(connection->direct ? peer.direct : peer.ap) = true;
+				(connection->direct ? peer.direct_latency : peer.ap_latency) = connection->latency;
+			} else {
+				++result.pending_connections;
+			}
+			for (const auto& stream : connection->streams) {
+				result.send_bytes += stream->pending;
+				result.streams += stream->handle != nullptr;
+			}
+		}
+		return result;
+	}
+
 	/** @brief Transfer ownership of queued receive payloads to the ROS executor. */
 	std::deque<Received> drain() {
 		std::lock_guard<std::recursive_mutex> lock(mutex_);
@@ -355,6 +404,21 @@ class QuicTransport {
 	}
 
 	private:
+	/**
+	 * @brief Read RTT estimates on the connection's MsQuic worker after a heartbeat.
+	 * GetParam executes inline on that worker. Calling it there avoids a blocking
+	 * cross-thread query under mutex_; status logging only copies the stored result.
+	 * The estimates come from existing QUIC acknowledgments and create no probes.
+	 */
+	void update_latency(Connection& connection) {
+		QUIC_STATISTICS_V2 statistics{};
+		uint32_t length = sizeof(statistics);
+		if (QUIC_SUCCEEDED(api_->GetParam(connection.handle, QUIC_PARAM_CONN_STATISTICS_V2, &length, &statistics)) &&
+			statistics.Rtt && statistics.MinRtt != UINT32_MAX && statistics.MaxRtt) {
+			connection.latency = {
+				statistics.Rtt, statistics.MinRtt, statistics.MaxRtt, statistics.RttVariance, Clock::now()};
+		}
+	}
 	/** @brief Version the application protocol independently of QUIC/TLS. */
 	static QUIC_BUFFER protocol() {
 		static uint8_t name[] = "mrs-quic-ros2";
@@ -533,17 +597,22 @@ class QuicTransport {
 			auto& observation = stream.connection->observation;
 			if (observation.instance != stream.instance || sequence > observation.sequence) {
 				observation = {status, stream.instance, sequence, Clock::now()};
+				update_latency(*stream.connection);
 			}
 			consumed += 36;
 		}
 		bytes.erase(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(consumed));
 		return bytes.size() < 36;
 	}
-	/** @brief Queue an owned buffer; release it only after acknowledgment/cancellation. */
-	void queue(Stream& stream, std::vector<uint8_t> bytes) {
+	/**
+	 * @brief Queue an owned buffer; release it after acknowledgment/cancellation.
+	 * @return False when the stream's pending-byte limit drops the sample.
+	 */
+	bool queue(Stream& stream, std::vector<uint8_t> bytes) {
 		if (stream.pending + bytes.size() > config_.max_pending) {
+			++send_drops_;
 			warn("Dropping message: QUIC topic channel " + stream.key + " is backpressured");
-			return;
+			return false;
 		}
 		auto* buffer = new SendBuffer{std::move(bytes), {}};
 		buffer->buffer = QUIC_BUFFER{static_cast<uint32_t>(buffer->data.size()), buffer->data.data()};
@@ -554,6 +623,7 @@ class QuicTransport {
 			delete buffer;
 			check(status, "StreamSend");
 		}
+		return true;
 	}
 	/**
 	 * @brief Reassemble stream chunks into complete ROS messages, checking their sizes.
@@ -603,7 +673,10 @@ class QuicTransport {
 			}
 			while (receive_bytes_ + length > config_.max_pending && !received_.empty()) {
 				receive_bytes_ -= received_.front().payload.size();
+				const auto& dropped = received_.front();
+				++receive_drops_by_topic_[{dropped.peer, dropped.key}];
 				received_.pop_front();
+				++receive_drops_;
 				warn("ROS receive queue full; dropping oldest pending sample");
 			}
 			Received message{stream.connection->peer, stream.instance, sequence, stream.key, {}};
@@ -727,6 +800,7 @@ class QuicTransport {
 					return QUIC_STATUS_BAD_CERTIFICATE;
 				}
 				connection.connected = true;
+				self.update_latency(connection);
 				RCLCPP_INFO(self.logger_, "Connected to %s over %s (mutual TLS)",
 					self.config_.name(connection.peer).c_str(), connection.direct ? "Wi-Fi Direct" : "AP");
 				break;
@@ -847,6 +921,9 @@ class QuicTransport {
 	std::map<std::pair<int, bool>, Clock::time_point> next_connect_;
 	Clock::time_point next_listener_{}, next_warning_{};
 	size_t receive_bytes_{};
+	uint64_t send_drops_{}, receive_drops_{};
+	std::map<std::pair<int, std::string>, TopicTraffic> exported_;
+	std::map<std::pair<int, std::string>, uint64_t> receive_drops_by_topic_;
 	std::deque<Received> received_;
 };
 

@@ -14,6 +14,7 @@
 #include "config.hpp"
 #include "network_utils.hpp"
 #include "radio_lease.hpp"
+#include "status.hpp"
 #include "wifi_discovery.hpp"
 #include "wifi_radio.hpp"
 #include "wpa_control.hpp"
@@ -62,6 +63,12 @@ class WifiDirect {
 		std::lock_guard<std::mutex> lock(mutex_);
 		return fleet_status_;
 	}
+	/** @brief Copy group/discovery diagnostics without issuing Wi-Fi commands. */
+	WifiStatus status() {
+		std::lock_guard<std::mutex> lock(mutex_);
+		return {fleet_status_, discovered_, nearby_,
+			config_.existing_interface.empty() ? group_ : config_.existing_interface, last_error_};
+	}
 	/** @brief Replace authenticated observations; the radio worker makes all policy decisions. */
 	void observe_peers(FleetPeers peers) {
 		std::lock_guard<std::mutex> lock(mutex_);
@@ -78,6 +85,8 @@ class WifiDirect {
 				{
 					std::lock_guard<std::mutex> lock(mutex_);
 					fleet_status_ = {};
+					discovered_.clear();
+					last_error_ = error.what();
 				}
 				RCLCPP_WARN(logger_, "Wi-Fi Direct unavailable: %s; retrying in 10 seconds", error.what());
 			}
@@ -208,6 +217,7 @@ class WifiDirect {
 		auto publish_status = [&]() {
 			std::lock_guard<std::mutex> lock(mutex_);
 			fleet_status_ = local;
+			last_error_.clear();
 		};
 		publish_status();
 		const auto original_interfaces = control_interfaces(request);
@@ -391,7 +401,8 @@ class WifiDirect {
 					std::lock_guard<std::mutex> lock(mutex_);
 					authenticated = peers_;
 				}
-				for (const auto& [peer, observation] : discover_owners(request, ap, config_, pinned)) {
+				NearbyUavs nearby;
+				for (const auto& [peer, observation] : discover_owners(request, ap, config_, pinned, nearby)) {
 					const auto failed = failed_groups_.find(peer);
 					if (failed != failed_groups_.end()) {
 						const auto report = authenticated.find(peer);
@@ -413,6 +424,18 @@ class WifiDirect {
 							observation.radio.frequency);
 					}
 					discovered[peer] = observation;
+				}
+				std::lock_guard<std::mutex> lock(mutex_);
+				discovered_ = discovered;
+				for (auto& [device, observation] : nearby) {
+					nearby_[device] = std::move(observation);
+				}
+				for (auto entry = nearby_.begin(); entry != nearby_.end();) {
+					if (Clock::now() - entry->second.seen > std::chrono::seconds(config_.peer_timeout)) {
+						entry = nearby_.erase(entry);
+					} else {
+						++entry;
+					}
 				}
 			};
 			while (!stop_) {
@@ -786,7 +809,9 @@ class WifiDirect {
 	const Config& config_;
 	rclcpp::Logger logger_;
 	std::mutex mutex_;
-	std::string group_;
+	std::string group_, last_error_;
+	DiscoveredOwners discovered_;
+	NearbyUavs nearby_;
 	FleetStatus fleet_status_;
 	FleetPeers peers_;
 	std::map<int, std::string> failed_groups_;

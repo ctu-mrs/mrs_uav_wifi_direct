@@ -65,9 +65,10 @@ struct Config {
 	int election_settle{30}, peer_timeout{12}, switch_hold{5}, host_cooldown{60};
 	bool ap{true}, fallback{true}, wifi{true}, port_per_uav{}, automatic_identity{};
 	size_t max_message{8388608}, max_pending{16777216};
+	double status_interval{2.0}, discovery_interval{2.0};
 	std::set<int> numbers;
 	std::map<int, std::string> names;
-	std::string interface, control_directory, control_interface;
+	std::string hostname, interface, control_directory, control_interface;
 	std::string existing_interface, prefix, cert, key, ca, identity_directory;
 	std::vector<TopicConfig> topics;
 
@@ -91,10 +92,10 @@ struct Config {
 		if (!root["uav_list"] || !root["uav_list"].IsSequence()) {
 			throw std::runtime_error("uav_list must be a list of full UAV names");
 		}
-		// An empty fleet is the installed default. Stop before identity, topic,
-		// certificate or network settings are needed, including on a non-UAV PC.
-		if (root["uav_list"].size() == 0) {
-			return;
+		status_interval = option(root, "status_interval_s", 2.0);
+		if (!std::isfinite(status_interval) || status_interval < 0 || status_interval > 3600 ||
+			(status_interval > 0 && status_interval < 0.1)) {
+			throw std::runtime_error("status_interval_s must be 0 (disabled), or 0.1..3600 seconds");
 		}
 		if (local_name.empty()) {
 			const auto environment_name = std::getenv("UAV_NAME");
@@ -108,6 +109,34 @@ struct Config {
 				throw std::runtime_error("gethostname failed");
 			}
 			local_name = std::string(host.data()).substr(0, std::string(host.data()).find('.'));
+		}
+		if (!token(local_name)) {
+			throw std::runtime_error("The hostname must be a valid ROS name component");
+		}
+		hostname = local_name;
+		discovery_interval = option(root, "discovery_interval_s", 2.0);
+		if (!std::isfinite(discovery_interval) || discovery_interval < 0.1 || discovery_interval > 3600) {
+			throw std::runtime_error("discovery_interval_s must be 0.1..3600 seconds");
+		}
+		const auto wifi_config = root["wifi_direct"];
+		interface = option(wifi_config, "interface", std::string("wlan0"));
+		control_directory = option(wifi_config, "control_directory", std::string("/run/wpa_supplicant"));
+		control_interface = option(wifi_config, "control_interface", std::string());
+		existing_interface = option(wifi_config, "existing_group_interface", std::string());
+		peer_timeout = option(wifi_config, "peer_timeout_s", 12);
+		if (peer_timeout < 3 || peer_timeout > 120) {
+			throw std::runtime_error("wifi_direct.peer_timeout_s must be 3..120");
+		}
+		const std::regex interface_name("[A-Za-z0-9_.-]{1,15}"), control_name("[A-Za-z0-9_.-]{1,32}");
+		if (!std::regex_match(interface, interface_name) ||
+			(!control_interface.empty() && !std::regex_match(control_interface, control_name)) ||
+			(!existing_interface.empty() && !std::regex_match(existing_interface, interface_name))) {
+			throw std::runtime_error("Invalid Wi-Fi interface name");
+		}
+		// Discovery also runs on ordinary PCs with an empty fleet. QUIC identities,
+		// shared topics and group management are needed only for participating UAVs.
+		if (root["uav_list"].size() == 0) {
+			return;
 		}
 		std::smatch name_match;
 		if (!std::regex_match(local_name, name_match, std::regex("uav([0-9]{1,2})"))) {
@@ -129,7 +158,7 @@ struct Config {
 		if (!numbers.count(own) || names.at(own) != local_name) {
 			throw std::runtime_error("The local UAV name must appear in uav_list");
 		}
-		const auto network = root["network"], wifi_config = root["wifi_direct"], tls = root["tls"];
+		const auto network = root["network"], tls = root["tls"];
 		port = option(network, "port", 4567);
 		port_per_uav = option(network, "port_per_uav", false);
 		ap = option(network, "ap_enabled", true);
@@ -150,12 +179,7 @@ struct Config {
 			}
 		}
 		wifi = option(wifi_config, "enabled", true);
-		interface = option(wifi_config, "interface", std::string("wlan0"));
-		control_directory = option(wifi_config, "control_directory", std::string("/run/wpa_supplicant"));
-		control_interface = option(wifi_config, "control_interface", std::string());
-		existing_interface = option(wifi_config, "existing_group_interface", std::string());
 		election_settle = option(wifi_config, "election_settle_s", 30);
-		peer_timeout = option(wifi_config, "peer_timeout_s", 12);
 		switch_hold = option(wifi_config, "switch_hold_s", 5);
 		host_cooldown = option(wifi_config, "host_cooldown_s", 60);
 		if (election_settle < 1 || election_settle > 60 || peer_timeout < 3 || peer_timeout > 120 || switch_hold < 1 ||
@@ -170,7 +194,7 @@ struct Config {
 			throw std::runtime_error("Enable AP transport or Wi-Fi Direct");
 		}
 		const auto name = local_name;
-		prefix = expand(option(root, "receive_prefix", std::string("/{hostname}/quic/peers")), name);
+		prefix = expand(option(root, "receive_prefix", std::string("/{hostname}/wifi_direct/peers")), name);
 		while (!prefix.empty() && prefix.back() == '/') {
 			prefix.pop_back();
 		}

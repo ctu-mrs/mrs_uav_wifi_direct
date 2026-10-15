@@ -1,8 +1,20 @@
 # UAVs allowed to exchange topics, including this UAV.
-# Default: [] disables topic sharing, QUIC connections and Wi-Fi Direct management.
+# Default: [] runs discovery only; topic sharing, QUIC and group management stay disabled.
 # Allowed: [] or unique names formed by "uav" and a number from 1 to 99.
 # A leading zero is allowed for single-digit numbers.
 uav_list: []
+
+# Periodic configuration, peer, topic-rate and health report, in seconds. Default: 2.0.
+# Includes passive QUIC round-trip latency estimates for each connected path.
+# Nearby UAV/group advertisements come from the existing discovery caches.
+# Allowed: 0 (disabled), or a finite value from 0.1 to 3600. Uses wall time.
+status_interval_s: 2.0
+
+# Publish local radio measurements and nearby UAV observations, in seconds.
+# Default: 2.0. Allowed: a finite value from 0.1 to 3600. Uses wall time.
+# Runs even with an empty uav_list. Reads existing caches and driver statistics;
+# collection uses the existing interfaces without starting extra scans.
+discovery_interval_s: 2.0
 
 # Addresses are read from each host interface's network settings.
 network:
@@ -83,9 +95,9 @@ wifi_direct:
   existing_group_interface: ""
 
 # Received topics appear at <prefix>/<sending UAV>/<topic key>.
-# Default: /{hostname}/quic/peers.
+# Default: /{hostname}/wifi_direct/peers.
 # Allowed: a valid ROS topic prefix, excluding "" and "/"; {hostname} is expanded.
-receive_prefix: "/{hostname}/quic/peers"
+receive_prefix: "/{hostname}/wifi_direct/peers"
 
 # Default in this file: the odometry entry below. Omit this list, or use [],
 # to exchange fleet status only. Allowed: up to 1024 entries with unique keys.

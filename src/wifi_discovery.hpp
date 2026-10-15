@@ -21,6 +21,79 @@ inline std::string encode_ssid(const std::string& ssid) {
 	return result;
 }
 /**
+ * @brief Record a named UAV from an already fetched P2P/BSS record, independently of join eligibility.
+ * Addresses identify observations, not trusted identities. Names, SSIDs and numeric
+ * fields are bounded before logging; the status formatter expires cached records.
+ * Reading advertisements from another fleet never adds it to the allowed UAV list.
+ */
+inline void observe_nearby(const std::string& record, const std::string& address, NearbyUavs& nearby) {
+	std::smatch name, age, frequency, capability, ssid, device, signal, bssid;
+	if (!std::regex_search(record, name,
+			std::regex("(?:^|\\n)(?:p2p_device_name|wps_device_name|device_name)=(uav[0-9]{1,2})(?:\\n|$)")) ||
+		std::stoi(name[1].str().substr(3)) == 0 ||
+		!std::regex_search(record, age, std::regex("(?:^|\\n)age=([0-9]{1,4})(?:\\n|$)")) || std::stoi(age[1]) > 120) {
+		return;
+	}
+	NearbyUav observation;
+	observation.name = name[1];
+	observation.device =
+		std::regex_search(record, device, std::regex("(?:^|\\n)p2p_device_addr=([0-9A-Fa-f:]{17})(?:\\n|$)"))
+		? device[1].str()
+		: address;
+	if (std::regex_search(record, device, std::regex("(?:^|\\n)interface_addr=([0-9A-Fa-f:]{17})(?:\\n|$)"))) {
+		observation.interface_address = device[1];
+	} else if (std::regex_search(record, bssid, std::regex("(?:^|\\n)bssid=([0-9A-Fa-f:]{17})(?:\\n|$)"))) {
+		observation.interface_address = bssid[1];
+	}
+	for (auto* mac : {&observation.device, &observation.interface_address}) {
+		std::transform(mac->begin(), mac->end(), mac->begin(), [](unsigned char value) { return std::tolower(value); });
+	}
+	observation.seen = Clock::now() - std::chrono::seconds(std::stoi(age[1]));
+	if (std::regex_search(record, frequency, std::regex("(?:^|\\n)(?:oper_freq|freq)=([0-9]{4})(?:\\n|$)"))) {
+		const auto value = std::stoul(frequency[1]);
+		if (value >= 2400 && value <= 7125) {
+			observation.frequency = value;
+		}
+	}
+	RadioChannel advertised;
+	bool pinned = false;
+	if (!observation.frequency && peer_radio_model(record, advertised, pinned)) {
+		observation.frequency = advertised.frequency;
+	}
+	observation.owner = std::regex_search(record, capability,
+							std::regex("(?:^|\\n)(?:p2p_group_capab|group_capab)=0x([0-9a-fA-F]{1,2})(?:\\n|$)")) &&
+		(std::stoul(capability[1], nullptr, 16) & 1);
+	if (std::regex_search(record, ssid, std::regex("(?:^|\\n)ssid=(DIRECT-[A-Za-z0-9_.-]{2,25})(?:\\n|$)"))) {
+		observation.ssid = ssid[1];
+	}
+	if (std::regex_search(record, signal, std::regex("(?:^|\\n)level=(-[0-9]{1,3})(?:\\n|$)")) &&
+		std::stoi(signal[1]) >= -127) {
+		observation.signal_dbm = std::stoi(signal[1]);
+	}
+	auto& current = nearby[observation.device];
+	if (current.seen > observation.seen) {
+		// A fresh beacon can add the SSID/RSSI omitted by a newer P2P record.
+		if (current.owner && observation.owner && (!current.frequency || current.frequency == observation.frequency) &&
+			Clock::now() - observation.seen <= 3s) {
+			if (current.interface_address.empty()) {
+				current.interface_address = observation.interface_address;
+			}
+			if (current.ssid.empty()) {
+				current.ssid = observation.ssid;
+			}
+			if (!current.signal_dbm) {
+				current.signal_dbm = observation.signal_dbm;
+			}
+			if (!current.frequency) {
+				current.frequency = observation.frequency;
+			}
+		}
+	} else {
+		current = std::move(observation);
+	}
+}
+
+/**
  * @brief Recover formed owners from fresh scan results when P2P_PEER is empty.
  * Some Full-MAC radios expose GO beacons only in the station BSS table. Require
  * both the P2P owner capability and configured P2P/WPS device name; an ordinary AP
@@ -28,13 +101,14 @@ inline std::string encode_ssid(const std::string& ssid) {
  * P2P_CONNECT join target even before the supplicant creates a peer record.
  */
 inline DiscoveredOwners cached_owners(
-	WpaControl& endpoint, const Config& config, const std::optional<RadioChannel>& pinned) {
+	WpaControl& endpoint, const Config& config, const std::optional<RadioChannel>& pinned, NearbyUavs& nearby) {
 	DiscoveredOwners result;
 	const auto table = endpoint.request("SCAN_RESULTS");
 	const std::regex entry("(?:^|\\n)([0-9A-Fa-f:]{17})\\t[^\\n]*\\[P2P\\][^\\n]*");
 	for (auto row = std::sregex_iterator(table.begin(), table.end(), entry); row != std::sregex_iterator(); ++row) {
 		const std::string bssid = (*row)[1];
 		const auto bss = endpoint.request("BSS " + bssid);
+		observe_nearby(bss, bssid, nearby);
 		std::smatch age, capability, name, frequency, ssid;
 		// A GO's beacon may omit its P2P Device Info name while carrying the
 		// same configured name in WPS. Both are unauthenticated startup hints;
@@ -102,8 +176,8 @@ inline uint32_t cached_group_frequency(
  * no AP, a client may follow a discovered owner's channel. Native attributes are
  * startup hints; mutual TLS subsequently authenticates the UAV and fleet state.
  */
-inline DiscoveredOwners discover_owners(
-	WpaControl& radio, WpaControl& station, const Config& config, const std::optional<RadioChannel>& pinned) {
+inline DiscoveredOwners discover_owners(WpaControl& radio, WpaControl& station, const Config& config,
+	const std::optional<RadioChannel>& pinned, NearbyUavs& nearby) {
 	DiscoveredOwners result;
 	auto peer = radio.request("P2P_PEER FIRST");
 	for (int index = 0; index < 128 && peer.compare(0, 4, "FAIL") != 0; ++index) {
@@ -112,6 +186,7 @@ inline DiscoveredOwners discover_owners(
 			break;
 		}
 		const std::string device = address[1];
+		observe_nearby(peer, device, nearby);
 		if (std::regex_search(peer, age, std::regex("(?:^|\\n)age=([0-9]{1,4})(?:\\n|$)")) && std::stoi(age[1]) <= 3 &&
 			std::regex_search(peer, capability, std::regex("(?:^|\\n)group_capab=0x([0-9a-fA-F]{1,2})(?:\\n|$)")) &&
 			(std::stoul(capability[1], nullptr, 16) & 1) &&
@@ -154,7 +229,7 @@ inline DiscoveredOwners discover_owners(
 		peer = radio.request("P2P_PEER NEXT-" + device);
 	}
 	for (auto* endpoint : {&radio, &station}) {
-		for (const auto& [number, observation] : cached_owners(*endpoint, config, pinned)) {
+		for (const auto& [number, observation] : cached_owners(*endpoint, config, pinned, nearby)) {
 			// Retain native channel settings, but include the actual fresh beacon's
 			// SSID/BSSID. An explicit group SSID avoids wildcard join scans,
 			// which some Full-MAC drivers cannot execute on the operating

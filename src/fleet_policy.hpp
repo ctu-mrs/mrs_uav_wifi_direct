@@ -6,6 +6,7 @@
 
 #include <algorithm>
 #include <map>
+#include <optional>
 #include <set>
 #include <tuple>
 
@@ -49,6 +50,15 @@ struct DiscoveredOwner {
 	// Optional exact SSID, encoded as hex for the supplicant's literal join argv.
 	std::string ssid{};
 };
+/** @brief Public P2P advertisement used only for nearby-device diagnostics, including other fleets. */
+struct NearbyUav {
+	std::string name, device, ssid, interface_address;
+	Clock::time_point seen{};
+	uint32_t frequency{};
+	std::optional<int> signal_dbm;
+	bool owner{};
+};
+using NearbyUavs = std::map<std::string, NearbyUav>;
 using FleetPeers = std::map<int, FleetObservation>;
 using DiscoveredOwners = std::map<int, DiscoveredOwner>;
 
