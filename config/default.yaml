@@ -18,18 +18,23 @@ discovery_interval_s: 2.0
 
 # Addresses are read from each host interface's network settings.
 network:
+  # Subnet assigned to managed P2P groups. Default: 192.168.255.0/24.
+  # Allowed: an aligned private IPv4 subnet within 10/8, 172.16/12 or 192.168/16,
+  # with prefix length 8..24; it must not overlap another host network.
+  # UAV n receives address <network base> + 100 + n. Use the same subnet on every UAV.
+  p2p_subnet: "192.168.255.0/24"
   # Port on which QUIC accepts connections. Default: 4567.
   # Allowed: 1..65535; with port_per_uav, leave room for the largest UAV number.
   port: 4567
-  # Add the UAV number to port, for multiple nodes on one host. Default: false.
+  # Add the UAV number to port, for multiple nodes on one host. Default: true.
   # Allowed: true or false.
-  port_per_uav: false
-  # Keep a QUIC connection through the AP while it is available. Default: true.
+  port_per_uav: true
+  # Keep a QUIC connection through the AP while it is available. Default: false.
   # Allowed: true or false; at least AP or Wi-Fi Direct must be enabled.
-  ap_enabled: true
-  # Send topics through the AP when the direct link is unavailable. Default: true.
+  ap_enabled: false
+  # Send topics through the AP when the direct link is unavailable. Default: false.
   # Allowed: true or false; requires ap_enabled to have an effect.
-  ap_fallback: true
+  ap_fallback: false
   # Packet priority requested for direct traffic. Default: 8 (CS1/background).
   # Allowed: 0..63; 0 requests normal priority. Driver handling may vary.
   direct_dscp: 8
@@ -94,10 +99,11 @@ wifi_direct:
   # Allowed: "" or an existing, addressed P2P interface name.
   existing_group_interface: ""
 
-# Received topics appear at <prefix>/<sending UAV>/<topic key>.
-# Default: /{hostname}/wifi_direct/peers.
-# Allowed: a valid ROS topic prefix, excluding "" and "/"; {hostname} is expanded.
-receive_prefix: "/{hostname}/wifi_direct/peers"
+# Parent path for received topics: <prefix>/<sending UAV>/<topic key>.
+# Default: ~/peers. ~ resolves to the node namespace.
+# Allowed: a ROS topic prefix with optional {hostname};
+# "" or "/" publishes directly at /<sending UAV>/<key>.
+peers_prefix: "~/peers"
 
 # Default in this file: the odometry entry below. Omit this list, or use [],
 # to exchange fleet status only. Allowed: up to 1024 entries with unique keys.
@@ -106,7 +112,8 @@ shared_topics:
   # Allowed: a letter or underscore, then letters, digits or underscores; up to 1024 characters.
   - key: odometry
     # Local source topic. Default example: /{hostname}/estimation_manager/odom_main; required.
-    # Allowed: a valid ROS topic name outside receive_prefix; {hostname} is expanded.
+    # Allowed: a valid ROS topic path distinct from received topics; {hostname} expands,
+    # and ~ denotes /<hostname>/wifi.
     topic: "/{hostname}/estimation_manager/odom_main"
     # ROS message type. Default example: nav_msgs/msg/Odometry; required.
     # Allowed: an installed package/msg/Type name, up to 1024 characters.

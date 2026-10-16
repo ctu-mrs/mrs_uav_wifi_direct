@@ -26,8 +26,8 @@ extern char** environ;
 namespace mrs_uav_wifi_direct {
 /**
  * @brief An IPv4 address and subnet assigned to a host interface.
- * Each network follows the fleet's UAV address mapping. Infer its offset from our
- * own assigned address, so neither a prefix nor an offset is duplicated in YAML.
+ * Each network follows the fleet's UAV address mapping. Infer peer addresses from
+ * our assigned IPv4 address and UAV number, including on externally managed links.
  * Reject peers outside this subnet instead of sending them through another network.
  */
 struct InterfaceNetwork {
@@ -91,8 +91,9 @@ inline InterfaceNetwork interface_network(const std::string& interface) {
 
 /**
  * @brief Run a command with separate arguments and capture its output.
- * The ROS node uses this only for read-only iw queries. A failed command raises an exception with its output. Commands
- * inherit the user's permissions; address configuration belongs to the already running network manager.
+ * Used for Wi-Fi queries and the network manager's configuration reload request.
+ * A failed command raises an exception with its output. Commands inherit the
+ * user's permissions; the existing network manager applies address configuration.
  */
 inline std::string command(const std::vector<std::string>& args) {
 	// Preserve the caller's existing permissions and avoid shell interpolation.

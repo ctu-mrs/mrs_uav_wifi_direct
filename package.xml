@@ -15,7 +15,7 @@
 	<depend>yaml-cpp</depend>
 	<depend>libssl-dev</depend>
 	<build_depend>pkg-config</build_depend>
-	<depend>mrs-uav-wifi-direct-support</depend>
+	<depend version_gte="2.6.3-mrs11">mrs-uav-wifi-direct-support</depend>
 	<exec_depend>launch</exec_depend>
 	<exec_depend>launch_ros</exec_depend>
 	<exec_depend>nav_msgs</exec_depend>

@@ -8,7 +8,7 @@ umask 022
 
 wifi_arch=$(dpkg --print-architecture)
 wifi_multiarch=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
-wifi_version=${MSQUIC_VERSION}-mrs10
+wifi_version=${MSQUIC_VERSION}-mrs11
 wifi_ci=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)
 wifi_output=${1:?Usage: .ci/build_support_package.sh ARTIFACTS_FOLDER}
 wifi_jobs=${MRS_BUILD_JOBS:-$(nproc)}
@@ -47,6 +47,13 @@ for wifi_header in msquic.h msquic_posix.h quic_sal_stub.h; do
 done
 install -m 644 "$wifi_source/LICENSE" "$wifi_root/usr/share/doc/$SUPPORT_PACKAGE/copyright"
 install -m 644 "$wifi_source/submodules/quictls/LICENSE.txt" "$wifi_root/usr/share/doc/$SUPPORT_PACKAGE/quictls-copyright"
+
+# The ROS process updates one runtime drop-in; networkd remains the address manager.
+install -d "$wifi_root/usr/lib/tmpfiles.d"
+cat >"$wifi_root/usr/lib/tmpfiles.d/mrs-uav-wifi-direct.conf" <<'TMPFILES'
+d /run/systemd/network/10-mrs-wifi-direct.network.d 0755 root root - -
+f /run/systemd/network/10-mrs-wifi-direct.network.d/50-address.conf 0664 root netdev - -
+TMPFILES
 {
 	git -C "$wifi_source" rev-parse HEAD
 	git -C "$wifi_source" submodule status submodules/quictls
@@ -316,24 +323,16 @@ fail() { printf 'Wi-Fi setup: %s\n' "$*" >&2; exit 1; }
 if [[ -e $wifi_state ]]; then
 	[[ ! -L $wifi_state && $(stat -c %u "$wifi_state") == 0 && $(stat -c %a "$wifi_state") == 700 ]] || fail "Unsafe saved setup permissions"
 fi
-if [[ -f $wifi_state/complete ]]; then
-	printf 'Keeping the existing Wi-Fi permissions and P2P address profile.\n'
-	exit 0
-fi
 if [[ -d $wifi_state ]]; then
 	bash /var/lib/dpkg/info/mrs-uav-wifi-direct-support.prerm rollback-setup
 fi
 wifi_user=${SUDO_USER:-${USER:-}}
 if [[ -z $wifi_user || $wifi_user == root ]]; then wifi_user=$(getent passwd 1000 | cut -d: -f1 || true); fi
-wifi_uav=${UAV_NAME:-$(hostname)}
-if [[ ! $wifi_uav =~ ^uav([0-9]{1,2})$ || -z $wifi_user ]]; then
-	printf 'QUIC support installed; automatic P2P setup requires a UAV name formed by uav and a number from 1 to 99.\n'
+if [[ -z $wifi_user ]]; then
+	printf 'QUIC support installed; automatic P2P setup requires a local user account.\n'
 	exit 0
 fi
-wifi_number=$((10#${BASH_REMATCH[1]}))
-((wifi_number >= 1 && wifi_number <= 99)) || exit 0
-wifi_host=$((100 + wifi_number))
-wifi_prefix=192.168.70 wifi_group=netdev wifi_control=/run/wpa_supplicant wifi_p2p=''
+wifi_group=netdev wifi_control=/run/wpa_supplicant wifi_p2p=''
 if [[ -d /sys/class/net/wlan0/phy80211 ]]; then
 	wifi_interface=wlan0
 else
@@ -351,7 +350,7 @@ if ! systemctl is-active --quiet "$wifi_service" || ! systemctl is-active --quie
 fi
 [[ $wifi_user =~ ^[a-z_][a-z0-9_-]*\$?$ ]] || fail "Invalid local user name"
 [[ $wifi_interface =~ ^[A-Za-z0-9_.-]{1,15}$ ]] || fail "Invalid Wi-Fi interface name"
-	for wifi_tool in getent id ip wpa_cli systemctl networkctl systemd-analyze groupadd usermod runuser install stat cmp; do
+	for wifi_tool in getent id ip wpa_cli systemctl networkctl busctl systemd-tmpfiles systemd-analyze groupadd usermod runuser install stat cmp; do
 		command -v "$wifi_tool" >/dev/null || fail "Missing command: $wifi_tool"
 	done
 	if ! getent passwd "$wifi_user" >/dev/null || [[ $(id -u "$wifi_user") == 0 ]]; then fail "Target must be an existing non-root account"; fi
@@ -381,28 +380,11 @@ fi
 	done
 	[[ $wifi_found == true ]] || fail "$wifi_service does not manage $wifi_interface"
 
-	# Check every existing interface subnet, including an AP wider than /24.
-	# Adding the P2P route must not shadow an existing infrastructure network.
-	ipv4_number() {
-		local a b c d
-		IFS=. read -r a b c d <<<"$1"
-		printf '%s\n' "$(((10#$a << 24) | (10#$b << 16) | (10#$c << 8) | 10#$d))"
-	}
-	wifi_network=$(ipv4_number "$wifi_prefix.0")
-	wifi_current_addresses=$(ip -o -4 address show) || fail "Cannot inspect existing IPv4 addresses"
-	while read -r _ wifi_device _ wifi_cidr _; do
-		[[ -n $wifi_cidr ]] || continue
-		wifi_bits=${wifi_cidr#*/}
-		wifi_mask=$(((0xffffffff << (32 - wifi_bits)) & 0xffffffff))
-		wifi_existing=$(ipv4_number "${wifi_cidr%/*}")
-		# Two prefixes overlap if their common, shorter prefix is equal.
-		((wifi_bits <= 24)) || wifi_mask=$((0xffffff00))
-		(((wifi_existing & wifi_mask) != (wifi_network & wifi_mask))) || fail "P2P subnet overlaps $wifi_cidr on $wifi_device"
-	done <<<"$wifi_current_addresses"
-	wifi_address=$wifi_prefix.$wifi_host/24
 	wifi_unit=/etc/systemd/system/$wifi_service.d/permissions.conf
 	wifi_profile=/etc/systemd/network/10-mrs-wifi-direct.network
-	wifi_requested=$(printf '%s\n' "$wifi_user" "$wifi_group" "$wifi_interface" "$wifi_service" "$wifi_control" "$wifi_p2p" "$wifi_address")
+	wifi_policy=/etc/polkit-1/rules.d/50-mrs-uav-wifi-direct.rules
+	wifi_restart=/etc/needrestart/conf.d/50-mrs-uav-wifi-direct.conf
+	wifi_requested=$(printf '%s\n' "$wifi_user" "$wifi_group" "$wifi_interface" "$wifi_service" "$wifi_control" "$wifi_p2p")
 
 	# Read and update the Wi-Fi control socket permissions.
 	wpa_value() {
@@ -459,16 +441,27 @@ fi
 	RequiredForOnline=no
 
 	[Network]
-	Address=$wifi_address
 	DHCP=no
 	LinkLocalAddressing=no
 	IPv6AcceptRA=no
 	ConfigureWithoutCarrier=yes
 	EOF
+	cat >"$wifi_work/policy" <<-EOF
+	// Allow only the installing account to reload profiles after P2P address updates.
+	polkit.addRule(function(action, subject) {
+		if (action.id === "org.freedesktop.network1.reload" && subject.user === "$wifi_user") {
+			return polkit.Result.YES;
+		}
+	});
+	EOF
+	cat >"$wifi_work/restart" <<-EOF
+	# Apply the replacement Wi-Fi executable at reboot, preserving the live AP link.
+	\$nrconf{override_rc}{qr(^\\Q$wifi_service\\E\$)} = 0;
+	EOF
 	# Verify syntax before replacing either persistent file or changing membership.
 	cp "$wifi_work/unit" "$wifi_work/permissions-check.service"
 	systemd-analyze verify "$wifi_work/permissions-check.service"
-	printf 'User: %s; group: %s; AP interface: %s; P2P address: %s\n' "$wifi_user" "$wifi_group" "$wifi_interface" "$wifi_address"
+	printf 'User: %s; group: %s; AP interface: %s\n' "$wifi_user" "$wifi_group" "$wifi_interface"
 	printf 'Existing service: %s\nFiles: %s\n       %s\n' "$wifi_service" "$wifi_unit" "$wifi_profile"
 
 	# Save the original files, membership and live socket metadata only once.
@@ -477,9 +470,11 @@ fi
 	install -d -m 700 "$wifi_state"
 	wifi_started=true
 	printf '%s\n' "$wifi_requested" >"$wifi_state/settings"
-	for wifi_kind in unit network; do
+	for wifi_kind in unit network policy restart; do
 		wifi_path=$wifi_unit
 		[[ $wifi_kind != network ]] || wifi_path=$wifi_profile
+		[[ $wifi_kind != policy ]] || wifi_path=$wifi_policy
+		[[ $wifi_kind != restart ]] || wifi_path=$wifi_restart
 		[[ ! -e $wifi_path ]] || cp -p -- "$wifi_path" "$wifi_state/original.$wifi_kind"
 		cp "$wifi_work/$wifi_kind" "$wifi_state/installed.$wifi_kind"
 	done
@@ -495,6 +490,9 @@ fi
 	touch "$wifi_state/snapshot-complete"
 	groupadd -f "$wifi_group"
 	usermod -aG "$wifi_group" "$wifi_user"
+	systemd-tmpfiles --create /usr/lib/tmpfiles.d/mrs-uav-wifi-direct.conf
+	# The node adds its address after authentication, keeping WPS clients IP-free.
+	printf '[Network]\n' >/run/systemd/network/10-mrs-wifi-direct.network.d/50-address.conf
 	for wifi_endpoint in "$wifi_interface" "$wifi_p2p"; do
 		[[ $(wpa_value "$wifi_endpoint" set ctrl_interface "DIR=$wifi_control GROUP=$wifi_group") == OK ]] || fail "Cannot set $wifi_endpoint socket group"
 	done
@@ -503,9 +501,11 @@ fi
 	chmod g+rw "$wifi_control/$wifi_interface" "$wifi_control/$wifi_p2p"
 
 	# A rename within the destination directory makes each config replacement atomic.
-	for wifi_kind in unit network; do
+	for wifi_kind in unit network policy restart; do
 		wifi_path=$wifi_unit
 		[[ $wifi_kind != network ]] || wifi_path=$wifi_profile
+		[[ $wifi_kind != policy ]] || wifi_path=$wifi_policy
+		[[ $wifi_kind != restart ]] || wifi_path=$wifi_restart
 		if [[ ! -d $(dirname -- "$wifi_path") ]]; then install -d -m 755 "$(dirname -- "$wifi_path")"; fi
 		wifi_temp=$(mktemp "$wifi_path.XXXXXX")
 		install -m 644 "$wifi_work/$wifi_kind" "$wifi_temp"
@@ -539,7 +539,7 @@ restore_setup() (
 		exit 1
 	}
 	mapfile -t wifi_settings <"$wifi_state/settings"
-	[[ ${#wifi_settings[@]} == 7 ]] || {
+	[[ ${#wifi_settings[@]} -ge 6 ]] || {
 		printf 'Incomplete setup snapshot; inspect %s.\n' "$wifi_state" >&2
 		exit 1
 	}
@@ -547,6 +547,8 @@ restore_setup() (
 	wifi_service=${wifi_settings[3]} wifi_control=${wifi_settings[4]} wifi_p2p=${wifi_settings[5]}
 	wifi_unit=/etc/systemd/system/$wifi_service.d/permissions.conf
 	wifi_profile=/etc/systemd/network/10-mrs-wifi-direct.network
+	wifi_policy=/etc/polkit-1/rules.d/50-mrs-uav-wifi-direct.rules
+	wifi_restart=/etc/needrestart/conf.d/50-mrs-uav-wifi-direct.conf
 	compgen -G "/sys/class/net/p2p-$wifi_interface-*" >/dev/null && {
 		printf 'Stop the mrs_uav_wifi_direct node before removing its support package.\n' >&2
 		exit 1
@@ -560,18 +562,22 @@ restore_setup() (
 
 	# Protect administrator edits. A previous partial uninstall is also accepted:
 	# each file may already match its original, or have been removed as intended.
-	for wifi_kind in unit network; do
+	for wifi_kind in unit network policy restart; do
 		wifi_path=$wifi_unit
 		[[ $wifi_kind != network ]] || wifi_path=$wifi_profile
+		[[ $wifi_kind != policy ]] || wifi_path=$wifi_policy
+		[[ $wifi_kind != restart ]] || wifi_path=$wifi_restart
 		if [[ -e $wifi_path ]] && ! cmp -s "$wifi_path" "$wifi_state/installed.$wifi_kind" && ! cmp -s "$wifi_path" "$wifi_state/original.$wifi_kind"; then
 			printf 'Configuration changed since installation: %s. Inspect it before uninstalling.\n' "$wifi_path" >&2
 			exit 1
 		fi
 	done
 	printf 'Restore previous files and Wi-Fi permissions for %s on %s.\n' "$wifi_user" "$wifi_interface"
-	for wifi_kind in unit network; do
+	for wifi_kind in unit network policy restart; do
 		wifi_path=$wifi_unit
 		[[ $wifi_kind != network ]] || wifi_path=$wifi_profile
+		[[ $wifi_kind != policy ]] || wifi_path=$wifi_policy
+		[[ $wifi_kind != restart ]] || wifi_path=$wifi_restart
 		if [[ -f $wifi_state/original.$wifi_kind ]]; then
 			if [[ ! -d $(dirname -- "$wifi_path") ]]; then install -d -m 755 "$(dirname -- "$wifi_path")"; fi
 			wifi_temp=$(mktemp "$wifi_path.XXXXXX")
@@ -582,6 +588,10 @@ restore_setup() (
 		fi
 	done
 	systemctl daemon-reload
+	if [[ -d /run/systemd/network/10-mrs-wifi-direct.network.d && ! -L /run/systemd/network/10-mrs-wifi-direct.network.d ]]; then
+		rm -f -- /run/systemd/network/10-mrs-wifi-direct.network.d/50-address.conf
+		rmdir /run/systemd/network/10-mrs-wifi-direct.network.d 2>/dev/null || true
+	fi
 	if systemctl is-active --quiet systemd-networkd; then networkctl reload; fi
 	for wifi_endpoint in "$wifi_interface" "$wifi_p2p"; do
 		if [[ -S $wifi_control/$wifi_endpoint ]]; then
@@ -656,7 +666,7 @@ Architecture: $wifi_arch
 Maintainer: Vojtech Vrba <vrba.vojtech@fel.cvut.cz>
 Depends: $wifi_depends, dkms, dpkg-dev, make, gcc, binutils, patch, kmod,
  libelf-dev, mokutil, openssl, initramfs-tools, linux-firmware, wireless-regdb,
- iw, iproute2, systemd, passwd,
+ iw, iproute2, systemd, polkitd, passwd,
  wpasupplicant, $wifi_headers
 Provides: libmsquic (= $MSQUIC_VERSION)
 Conflicts: libmsquic, libmsquic-debug

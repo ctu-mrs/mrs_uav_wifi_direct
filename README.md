@@ -3,9 +3,9 @@
 
 # MRS UAV Wi-Fi Direct
 
-This package shares ROS 2 topics between UAVs over Wi-Fi. It can use the existing access point (AP) connection and create an additional [Wi-Fi Direct](https://en.wikipedia.org/wiki/Wi-Fi_Direct) (peer-to-peer) connection between the UAVs. The direct connection carries data without going through the AP.
+This package shares ROS 2 topics between UAVs over Wi-Fi. It can use the existing access point (AP) connection and create an additional [Wi-Fi Direct](https://en.wikipedia.org/wiki/Wi-Fi_Direct) (peer-to-peer) connection between the UAVs. The direct connection carries data without going through the AP, while maintaining concurrent AP connection.
 
-Messages travel over [QUIC](https://github.com/microsoft/msquic), which provides encryption and reliable delivery. Each topic has a separate stream, so packet loss on one topic can be recovered while other topics continue sending.
+The P2P network enables direct connection of multiple UAV Zenoh routers. Additionaly, topic messages may travel over implemented [QUIC](https://github.com/microsoft/msquic) protocol, which provides encryption and reliable delivery. Each topic has a separate stream, so packet loss on one topic can be recovered while other topics continue sending.
 
 ## Install
 
@@ -17,7 +17,7 @@ sudo apt install ros-jazzy-mrs-uav-wifi-direct
 
 This also installs `mrs-uav-wifi-direct-support`, which contains the QUIC library and Wi-Fi support. DKMS builds supported kernel changes needed by the radio (on Intel NUC) and rebuilds them after kernel updates. The installing user is also granted access to Wi-Fi control and P2P address profile configuration. The support package installation takes effect after a reboot, to leave the running Wi-Fi connection in place.
 
-Automatic setup uses the existing netplan `wpa_supplicant` service and `systemd-networkd`. Wi-Fi control access also lets the selected account change the AP connection, so use a trusted local account. The additional address uses subnet `192.168.70.0/24`, with the last byte equal to 100 plus the UAV number. This subnet must be separate from the host's other networks.
+Automatic setup uses the existing netplan `wpa_supplicant` service and `systemd-networkd`. Wi-Fi control access also lets the selected account change the AP connection, so use a trusted local account. The P2P addresses use subnet `192.168.255.0/24`.
 
 ## Quick Start
 
@@ -40,8 +40,6 @@ shared_topics:
     reliability: "best_effort"
 ```
 
-`{hostname}` expands to `UAV_NAME` when set, or the system hostname otherwise. Each topic needs a unique `key`. Use matching UAV lists, keys, and message types on all UAVs, and install the message packages on each one.
-
 A positive `rate_hz` sends the latest sample at up to that rate. Set it to zero, or leave it out, to send every new sample. The default `best_effort` subscription works with common sensor publishers. Choose `reliable` when the source publisher supports reliable delivery, especially for large images or arrays.
 
 Start the node on each UAV (either directly or in a TMUX session):
@@ -49,8 +47,6 @@ Start the node on each UAV (either directly or in a TMUX session):
 ```bash
 ros2 launch mrs_uav_wifi_direct mrs_uav_wifi_direct.launch.py config_path:="$HOME/mrs_uav_wifi_direct.yaml"
 ```
-
-Received topic names follow `/<local UAV>/wifi_direct/peers/<sending UAV>/<key>`. [default.yaml](config/default.yaml) explains every setting and its allowed values.
 
 ## How the connections work
 
@@ -62,15 +58,15 @@ Topic traffic prefers the direct connection and falls back to the AP when enable
 
 Addresses come from the host's network settings. Within each subnet, the difference between the address's last byte and the UAV number must be the same for every UAV. The node derives this mapping separately for the AP and direct interfaces.
 
-Wi-Fi Direct requires radio and driver support for an AP connection and a P2P group at the same time. A single radio shares its airtime between them, so direct traffic and group setup can affect AP latency and throughput. Direct packets request background priority by default. The node manages the group it creates and removes it when stopped. `iw dev` shows the current AP and P2P interfaces; successful node logs include `Connected to ... over Wi-Fi Direct`.
-
 If another network manager already creates the group, set `wifi_direct.existing_group_interface` to that interface. The node will use its assigned address and leave group management to that manager.
+
+The P2P network also carries ordinary IP traffic. With `rmw_zenoh_cpp`, the UAVs' Zenoh routers can use this network to share ROS topics directly. Configure a router on each UAV with the other UAVs' P2P addresses. Independently, the `shared_topics` configuration section controls the separate QUIC bridge.
+
+In your copy of router config (`zenoh_router.json5`), add to `connect` block the IPs of other UAVs on the P2P subnet (192.168.255.* by defeault). Set listening to `0.0.0.0` to allow establishing Zenoh connections on a P2P network which appears later (binding the listener to a P2P address or adding `#iface=p2p-wlan0-…` requires that interface to exist already). Communication begins when the local router and the peer connection are available.
 
 ## Discovery and status
 
-`/<hostname>/wifi_direct/discovery` publishes a `mrs_uav_wifi_direct/msg/Discovery` snapshot periodically, including with an empty `uav_list`. It contains the local AP signal and link statistics, nearby UAV names and groups, connected peers, QUIC latency, and topic rates and drop counts. The node also prints a compact status report every two seconds. Set `discovery_interval_s` and `status_interval_s` to change these intervals, zero disables status printing.
-
-Measurements come from the running driver and existing Wi-Fi discovery caches. Collection reads these without starting extra scans. Nearby UAVs appear when the host has recently observed their advertisements. Observations expire after `wifi_direct.peer_timeout_s`. Other fleets can appear in discovery, while only configured UAVs exchange topics. Measurement ages help distinguish a new publication from a new radio sample. QUIC library provides latency information, including network queuing and processing delays.
+Measurements come from the running driver and existing Wi-Fi discovery caches. Collection reads these without starting extra scans. Nearby UAVs appear when the host has recently observed their advertisements. Observations expire after `wifi_direct.peer_timeout_s`. Other fleets can appear in discovery, while only configured UAVs exchange topics. Measurement ages help distinguish a new publication from a new radio sample. The QUIC library provides latency information, including network queuing and processing delays.
 
 ## Certificates
 

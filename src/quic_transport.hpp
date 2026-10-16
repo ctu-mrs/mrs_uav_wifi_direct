@@ -80,7 +80,8 @@ class QuicTransport {
 		std::random_device random;
 		instance_ = (static_cast<uint64_t>(random()) << 32) | random();
 		// A fleet remains the same when a UAV loses its AP or changes local subnets.
-		std::vector<std::string> fields{std::to_string(config_.port), std::to_string(config_.port_per_uav)};
+		std::vector<std::string> fields{
+			std::to_string(config_.port), std::to_string(config_.port_per_uav), config_.p2p_subnet.cidr()};
 		for (const auto& [number, name] : config_.names) {
 			fields.push_back(name);
 		}

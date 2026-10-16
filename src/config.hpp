@@ -4,7 +4,6 @@
  */
 #pragma once
 
-#include <unistd.h>
 #include <yaml-cpp/yaml.h>
 
 #include <algorithm>
@@ -17,8 +16,10 @@
 #include <regex>
 #include <set>
 #include <stdexcept>
+#include <utility>
 
 #include "common.hpp"
+#include "p2p_address.hpp"
 
 namespace mrs_uav_wifi_direct {
 /** @brief Check that a topic key is one valid ROS name component. */
@@ -26,12 +27,44 @@ inline bool token(const std::string& value) {
 	return std::regex_match(value, std::regex("[A-Za-z_][A-Za-z_0-9]*"));
 }
 
-/** @brief Substitute {hostname} in topics/paths and expand the leading ~/ in TLS paths. */
-inline std::string expand(std::string value, const std::string& name) {
+/** @brief Substitute the local UAV name into configured text. */
+inline std::string expand_hostname(std::string value, const std::string& name) {
 	for (size_t pos = 0; (pos = value.find("{hostname}", pos)) != std::string::npos;) {
 		value.replace(pos, std::string("{hostname}").size(), name);
 		pos += name.size();
 	}
+	return value;
+}
+
+/** @brief Return the fixed namespace shared by this package's ROS endpoints. */
+inline std::string node_prefix(const std::string& hostname) {
+	return "/" + hostname + "/wifi";
+}
+
+/** @brief Resolve a ROS path; ~ denotes /<hostname>/wifi, independently of the executable name. */
+inline std::string expand_topic(std::string value, const std::string& hostname) {
+	value = expand_hostname(std::move(value), hostname);
+	if (!value.empty() && value.front() == '~') {
+		if (value.size() > 1 && value[1] != '/') {
+			throw std::runtime_error("ROS topic paths must use ~ or ~/ before the package-relative path");
+		}
+		value.replace(0, 1, node_prefix(hostname));
+	}
+	std::string path;
+	for (const char ch : "/" + value) {
+		if (ch != '/' || path.empty() || path.back() != '/') {
+			path += ch;
+		}
+	}
+	while (path.size() > 1 && path.back() == '/') {
+		path.pop_back();
+	}
+	return path;
+}
+
+/** @brief Expand hostname placeholders and the user's home directory in filesystem paths. */
+inline std::string expand_path(std::string value, const std::string& hostname) {
+	value = expand_hostname(std::move(value), hostname);
 	if (value.compare(0, 2, "~/") == 0) {
 		const auto home = std::getenv("HOME");
 		if (!home) {
@@ -56,21 +89,22 @@ struct TopicConfig {
 };
 /**
  * @brief Validated runtime settings, loaded before sockets or radio state change.
- * All UAVs use the same fleet list and certificate policy. The local name comes
- * from the hostname parameter, then UAV_NAME, then the system hostname.
+ * All UAVs use the same fleet list and certificate policy. The launch file supplies
+ * the local name through the hostname parameter.
  * AP and P2P addressing come from their interfaces' actual host configuration.
  */
 struct Config {
 	int own{}, port{4567}, direct_dscp{8}, address_timeout{15};
 	int election_settle{30}, peer_timeout{12}, switch_hold{5}, host_cooldown{60};
-	bool ap{true}, fallback{true}, wifi{true}, port_per_uav{}, automatic_identity{};
+	bool ap{}, fallback{}, wifi{true}, port_per_uav{true}, automatic_identity{};
 	size_t max_message{8388608}, max_pending{16777216};
 	double status_interval{2.0}, discovery_interval{2.0};
 	std::set<int> numbers;
 	std::map<int, std::string> names;
 	std::string hostname, interface, control_directory, control_interface;
-	std::string existing_interface, prefix, cert, key, ca, identity_directory;
+	std::string existing_interface, peers_prefix, cert, key, ca, identity_directory;
 	std::vector<TopicConfig> topics;
+	P2pSubnet p2p_subnet;
 
 	/** @brief Return the configured spelling of the UAV name, including a leading zero. */
 	std::string name(int number) const {
@@ -98,22 +132,20 @@ struct Config {
 			throw std::runtime_error("status_interval_s must be 0 (disabled), or 0.1..3600 seconds");
 		}
 		if (local_name.empty()) {
-			const auto environment_name = std::getenv("UAV_NAME");
-			if (environment_name) {
-				local_name = environment_name;
-			}
-		}
-		if (local_name.empty()) {
-			std::array<char, 256> host{};
-			if (::gethostname(host.data(), host.size() - 1) != 0) {
-				throw std::runtime_error("gethostname failed");
-			}
-			local_name = std::string(host.data()).substr(0, std::string(host.data()).find('.'));
+			throw std::runtime_error("hostname must be provided by the launch file");
 		}
 		if (!token(local_name)) {
 			throw std::runtime_error("The hostname must be a valid ROS name component");
 		}
 		hostname = local_name;
+		if (root["peers_prefix"] && !root["peers_prefix"].IsScalar()) {
+			throw std::runtime_error("peers_prefix must be a ROS topic path string");
+		}
+		peers_prefix = expand_topic(option(root, "peers_prefix", std::string("~/peers")), hostname);
+		if (peers_prefix == "/") {
+			peers_prefix.clear();
+		}
+		p2p_subnet = P2pSubnet(option(root["network"], "p2p_subnet", std::string("192.168.255.0/24")));
 		discovery_interval = option(root, "discovery_interval_s", 2.0);
 		if (!std::isfinite(discovery_interval) || discovery_interval < 0.1 || discovery_interval > 3600) {
 			throw std::runtime_error("discovery_interval_s must be 0.1..3600 seconds");
@@ -160,9 +192,9 @@ struct Config {
 		}
 		const auto network = root["network"], tls = root["tls"];
 		port = option(network, "port", 4567);
-		port_per_uav = option(network, "port_per_uav", false);
-		ap = option(network, "ap_enabled", true);
-		fallback = option(network, "ap_fallback", true);
+		port_per_uav = option(network, "port_per_uav", port_per_uav);
+		ap = option(network, "ap_enabled", ap);
+		fallback = option(network, "ap_fallback", fallback);
 		direct_dscp = option(network, "direct_dscp", 8);
 		if (direct_dscp < 0 || direct_dscp > 63) {
 			throw std::runtime_error("network.direct_dscp must be an integer from 0 to 63");
@@ -194,18 +226,11 @@ struct Config {
 			throw std::runtime_error("Enable AP transport or Wi-Fi Direct");
 		}
 		const auto name = local_name;
-		prefix = expand(option(root, "receive_prefix", std::string("/{hostname}/wifi_direct/peers")), name);
-		while (!prefix.empty() && prefix.back() == '/') {
-			prefix.pop_back();
-		}
-		if (prefix.empty()) {
-			throw std::runtime_error("receive_prefix must not be empty or /");
-		}
-		cert = expand(option(tls, "certificate", std::string()), name);
-		key = expand(option(tls, "private_key", std::string()), name);
-		ca = expand(option(tls, "ca_certificate", std::string()), name);
+		cert = expand_path(option(tls, "certificate", std::string()), name);
+		key = expand_path(option(tls, "private_key", std::string()), name);
+		ca = expand_path(option(tls, "ca_certificate", std::string()), name);
 		identity_directory =
-			expand(option(tls, "identity_directory", std::string("~/.ros/mrs_uav_wifi_direct/{hostname}")), name);
+			expand_path(option(tls, "identity_directory", std::string("~/.ros/mrs_uav_wifi_direct/{hostname}")), name);
 		if (identity_directory.empty() || cert.empty() != key.empty()) {
 			throw std::runtime_error("Set both certificate/private_key or neither, and a nonempty identity_directory");
 		}
@@ -228,7 +253,7 @@ struct Config {
 		}
 		if (shared) {
 			for (const auto& entry : shared) {
-				TopicConfig topic{entry["key"].as<std::string>(), expand(entry["topic"].as<std::string>(), name),
+				TopicConfig topic{entry["key"].as<std::string>(), expand_topic(entry["topic"].as<std::string>(), name),
 					entry["message_type"].as<std::string>(), option(entry, "rate_hz", 0.0)};
 				const auto reliability = option(entry, "reliability", std::string("best_effort"));
 				if (reliability != "best_effort" && reliability != "reliable") {
@@ -236,8 +261,8 @@ struct Config {
 				}
 				topic.reliable = reliability == "reliable";
 				if (!token(topic.key) || topic.key.size() > 1024 || !keys.insert(topic.key).second ||
-					topic.source.empty() || topic.type.empty() || topic.type.size() > 1024 ||
-					!std::isfinite(topic.hz) || topic.hz < 0 || topic.hz > 1000000 ||
+					topic.source == "/" || topic.type.empty() || topic.type.size() > 1024 || !std::isfinite(topic.hz) ||
+					topic.hz < 0 || topic.hz > 1000000 ||
 					(topic.hz > 0 && 1e9 / topic.hz >= static_cast<double>(std::numeric_limits<int64_t>::max()))) {
 					throw std::runtime_error("Invalid topic key, type, source or rate_hz");
 				}

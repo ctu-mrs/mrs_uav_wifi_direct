@@ -21,6 +21,67 @@ inline std::string encode_ssid(const std::string& ssid) {
 	return result;
 }
 /**
+ * @brief Read our channel metadata from the WPS model attribute in a cached beacon/probe response.
+ * BSS replies expose the device name as text, but leave the model inside the raw
+ * information elements. Reassemble WPS vendor elements before walking their TLVs;
+ * each length is checked before reading. These public hints help election only.
+ */
+inline bool beacon_radio_model(const std::string& record, RadioChannel& radio, bool& pinned) {
+	const auto start = record.find("\nie=");
+	if (start == std::string::npos) {
+		return false;
+	}
+	const auto end = record.find('\n', start + 4);
+	const auto hex = record.substr(start + 4, end == std::string::npos ? end : end - start - 4);
+	if (hex.empty() || hex.size() > 8192 || hex.size() % 2) {
+		return false;
+	}
+	auto nibble = [](char value) -> int {
+		if (value >= '0' && value <= '9') {
+			return value - '0';
+		}
+		if (value >= 'a' && value <= 'f') {
+			return value - 'a' + 10;
+		}
+		return value >= 'A' && value <= 'F' ? value - 'A' + 10 : -1;
+	};
+	std::vector<uint8_t> ies, wps;
+	for (size_t i = 0; i < hex.size(); i += 2) {
+		const int high = nibble(hex[i]), low = nibble(hex[i + 1]);
+		if (high < 0 || low < 0) {
+			return false;
+		}
+		ies.push_back(static_cast<uint8_t>((high << 4) | low));
+	}
+	for (size_t pos = 0; pos < ies.size();) {
+		if (ies.size() - pos < 2 || ies[pos + 1] > ies.size() - pos - 2) {
+			return false;
+		}
+		const size_t length = ies[pos + 1];
+		if (ies[pos] == 221 && length >= 4 && ies[pos + 2] == 0 && ies[pos + 3] == 0x50 && ies[pos + 4] == 0xf2 &&
+			ies[pos + 5] == 4) {
+			wps.insert(wps.end(), ies.begin() + pos + 6, ies.begin() + pos + 2 + length);
+		}
+		pos += 2 + length;
+	}
+	for (size_t pos = 0; pos < wps.size();) {
+		if (wps.size() - pos < 4) {
+			return false;
+		}
+		const auto type = integer(wps.data() + pos, 2), length = integer(wps.data() + pos + 2, 2);
+		pos += 4;
+		if (length > wps.size() - pos) {
+			return false;
+		}
+		if (type == 0x1023 && length > 0 && length <= 32) {
+			return peer_radio_model(
+				"model_name=" + std::string(wps.begin() + pos, wps.begin() + pos + length), radio, pinned);
+		}
+		pos += length;
+	}
+	return false;
+}
+/**
  * @brief Record a named UAV from an already fetched P2P/BSS record, independently of join eligibility.
  * Addresses identify observations, not trusted identities. Names, SSIDs and numeric
  * fields are bounded before logging; the status formatter expires cached records.
@@ -125,6 +186,14 @@ inline DiscoveredOwners cached_owners(
 		if (value < 2400 || value > 5885 || (pinned && value != pinned->frequency)) {
 			continue;
 		}
+		RadioChannel observed{value, 0, 0, 0}, advertised;
+		bool ap_present = false;
+		if (beacon_radio_model(bss, advertised, ap_present)) {
+			if (advertised.frequency != value || (pinned && !(advertised == *pinned))) {
+				continue;
+			}
+			observed = advertised;
+		}
 		std::string ssid_hex;
 		if (std::regex_search(bss, ssid, std::regex("(?:^|\\n)ssid=(DIRECT-[A-Za-z0-9_.-]{2,25})(?:\\n|$)"))) {
 			ssid_hex = encode_ssid(ssid[1]);
@@ -132,7 +201,7 @@ inline DiscoveredOwners cached_owners(
 		for (const auto& [number, full_name] : config.names) {
 			if (number != config.own && full_name == name[1]) {
 				result[number] = {
-					bssid, Clock::now() - std::chrono::seconds(std::stoi(age[1])), {value, 0, 0, 0}, false, ssid_hex};
+					bssid, Clock::now() - std::chrono::seconds(std::stoi(age[1])), observed, ap_present, ssid_hex};
 			}
 		}
 	}
@@ -235,6 +304,11 @@ inline DiscoveredOwners discover_owners(WpaControl& radio, WpaControl& station, 
 			// which some Full-MAC drivers cannot execute on the operating
 			// channel. Supplicant still handles WPS provisioning. Never merge channels.
 			auto [entry, inserted] = result.emplace(number, observation);
+			if (!inserted && !entry->second.radio.width && observation.radio.width &&
+				entry->second.radio.frequency == observation.radio.frequency) {
+				entry->second.radio = observation.radio;
+				entry->second.ap_present = observation.ap_present;
+			}
 			if (!inserted && !observation.ssid.empty() &&
 				entry->second.radio.frequency == observation.radio.frequency) {
 				entry->second.ssid = observation.ssid;

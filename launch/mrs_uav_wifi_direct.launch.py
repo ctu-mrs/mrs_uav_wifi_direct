@@ -27,11 +27,6 @@ def generate_launch_description():
 				),
 			),
 			DeclareLaunchArgument(
-				"namespace",
-				default_value=hostname,
-				description="ROS namespace; defaults to UAV_NAME or the system hostname.",
-			),
-			DeclareLaunchArgument(
 				"use_sim_time",
 				default_value=EnvironmentVariable("USE_SIM_TIME", default_value="false"),
 				description="Use the ROS simulation clock; transport rate timers use wall time.",
@@ -40,7 +35,7 @@ def generate_launch_description():
 				package="mrs_uav_wifi_direct",
 				executable="mrs_uav_wifi_direct_node",
 				output="screen",
-				namespace=LaunchConfiguration("namespace"),
+				namespace=f"/{hostname}/wifi",
 				parameters=[
 					{
 						"config_path": LaunchConfiguration("config_path"),

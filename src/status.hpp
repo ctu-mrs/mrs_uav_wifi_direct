@@ -169,7 +169,7 @@ inline std::string status_summary(const Config& config, const std::string& path,
 	if (config.numbers.empty()) {
 		out << "Status DISCOVERY_ONLY " << config.hostname << " | config=" << path
 			<< " | uav_list=[] interface=" << config.interface << " nearby(unverified/cache)=" << status_list(nearby)
-			<< " discovery=/" << config.hostname << "/wifi_direct/discovery";
+			<< " discovery=" << node_prefix(config.hostname) << "/discovery";
 		return out.str();
 	}
 	const auto peers = config.numbers.size() - 1;
@@ -184,7 +184,8 @@ inline std::string status_summary(const Config& config, const std::string& path,
 		<< " | fleet=" << status_list(configured) << " port=" << config.listen_port(config.own)
 		<< " TLS=" << (config.ca.empty() ? "peer_pinning" : "CA") << " max_message=" << config.max_message
 		<< "B stream/receive_limit=" << config.max_pending << "B"
-		<< " interface=" << config.interface << " peer_timeout=" << config.peer_timeout << "s";
+		<< " interface=" << config.interface << " p2p_subnet=" << config.p2p_subnet.cidr()
+		<< " peer_timeout=" << config.peer_timeout << "s";
 	out << "\n  links: AP=" << status_network(config.ap, transport.ap, transport.ap_listening)
 		<< " fallback=" << (config.fallback ? "on" : "off")
 		<< " | direct=" << status_network(config.wifi, transport.direct, transport.direct_listening);

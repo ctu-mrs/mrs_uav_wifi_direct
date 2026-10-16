@@ -33,6 +33,7 @@ class WifiDirect {
 	WifiDirect(const Config& config, rclcpp::Logger logger) : config_(config), logger_(logger) {
 		if (config_.wifi && config_.existing_interface.empty()) {
 			lease_ = std::make_unique<RadioLease>(config_.interface);
+			config_.p2p_subnet.prepare(config_.interface, lease_->previous_group());
 		}
 	}
 	/** @brief Stop the worker and remove its owned group before configuration is destroyed. */
@@ -55,7 +56,11 @@ class WifiDirect {
 			std::lock_guard<std::mutex> lock(mutex_);
 			name = config_.existing_interface.empty() ? group_ : config_.existing_interface;
 		}
-		return config_.wifi && interface_carrier(name) && interface_network(name) ? name : "";
+		const auto network = interface_network(name);
+		return config_.wifi && interface_carrier(name) && network &&
+				(!config_.existing_interface.empty() || config_.p2p_subnet.matches(network, config_.own))
+			? name
+			: "";
 	}
 
 	/** @brief Publish a consistent capability/group snapshot to the ROS maintenance callback. */
@@ -79,6 +84,7 @@ class WifiDirect {
 	/** @brief Retry failed group setup after a short wait that can be interrupted by shutdown. */
 	void run() {
 		while (!stop_) {
+			int wait_steps = 10;
 			try {
 				manage_group();
 			} catch (const std::exception& error) {
@@ -89,8 +95,10 @@ class WifiDirect {
 					last_error_ = error.what();
 				}
 				RCLCPP_WARN(logger_, "Wi-Fi Direct unavailable: %s; retrying in 10 seconds", error.what());
+				wait_steps = 50;
 			}
-			for (int i = 0; i < 50 && !stop_; ++i) {
+			// Let asynchronous driver teardown finish before changing the P2P role.
+			for (int i = 0; i < wait_steps && !stop_; ++i) {
 				std::this_thread::sleep_for(200ms);
 			}
 		}
@@ -102,6 +110,8 @@ class WifiDirect {
 	 * The existing network manager continues to control the AP connection and routes.
 	 */
 	void manage_group() {
+		// Every attempt starts without IP connectivity on temporary WPS clients.
+		config_.p2p_subnet.prepare(config_.interface, lease_->previous_group());
 		std::ifstream phy_file("/sys/class/net/" + config_.interface + "/phy80211/name");
 		std::string phy;
 		phy_file >> phy;
@@ -109,6 +119,11 @@ class WifiDirect {
 			throw std::runtime_error("Cannot identify the Wi-Fi radio");
 		}
 		const auto capabilities = command({"iw", "phy", phy, "info"});
+		std::error_code driver_error;
+		const auto driver =
+			std::filesystem::read_symlink("/sys/class/net/" + config_.interface + "/device/driver", driver_error)
+				.filename();
+		const bool full_mac = !driver_error && driver == "brcmfmac";
 		const bool client_capable = concurrent_combination(capabilities, false);
 		const bool owner_capable = concurrent_combination(capabilities, true);
 		if (!client_capable && !owner_capable) {
@@ -123,7 +138,7 @@ class WifiDirect {
 			std::regex_search(status, freq, std::regex("(?:^|\\n)freq=([0-9]+)"));
 		// A wider AP and a 20 MHz GO can create separate firmware channel contexts
 		// even with the same primary frequency. Request the AP's width as well.
-		const auto ap_radio = ap_present ? command({"iw", "dev", config_.interface, "info"}) : "";
+		auto ap_radio = ap_present ? command({"iw", "dev", config_.interface, "info"}) : "";
 		const auto channels = command({"iw", "phy", phy, "channels"});
 		const auto standalone = standalone_channel(channels);
 		FleetStatus local;
@@ -187,6 +202,17 @@ class WifiDirect {
 			}
 		}
 		lease_->forget();
+		if (full_mac) {
+			const auto interfaces = control_interfaces(request);
+			if (std::all_of(interfaces.begin(), interfaces.end(),
+					[&](const auto& interface) { return interface == config_.interface || interface == control; })) {
+				// Full-MAC firmware can retain discovery state across client/owner
+				// transitions. Reset P2P state while no group exists. The primary
+				// station stays associated; externally managed groups prevent reset.
+				request.ok("P2P_SET disabled 1");
+				request.ok("P2P_SET disabled 0");
+			}
+		}
 		// Prefer the existing station connection when supplicant resolves concurrency.
 		request.ok("P2P_SET conc_pref sta");
 		// NO_IR prohibits creating a GO, but permits joining an existing GO.
@@ -224,8 +250,10 @@ class WifiDirect {
 		std::unique_ptr<WpaControl> pending_client;
 		auto next_pending_check = Clock::time_point{};
 		auto next_pbc = Clock::time_point{};
+		auto enrollment_until = Clock::time_point{};
+		auto empty_group_since = Clock::now();
 		auto address_deadline = Clock::time_point{};
-		bool addressed = false;
+		bool addressed = false, address_requested = false;
 		std::unique_ptr<WpaControl> group_control;
 		std::unique_ptr<WpaControl> group_monitor;
 		// With an AP, pin the first scan and listening, and delay subsequent social
@@ -240,16 +268,10 @@ class WifiDirect {
 															   : local.radio.frequency;
 		const auto scan_channels = discovery_channels(channels, preferred_frequency);
 		const auto bootstrap_primary = scan_channels.front();
-		std::error_code driver_error;
-		const auto driver =
-			std::filesystem::read_symlink("/sys/class/net/" + config_.interface + "/device/driver", driver_error)
-				.filename();
-		// brcmfmac can omit Intel GOs from native discovery even on social
-		// channels, and rejects wildcard P2P scans with a non-social listen
-		// channel. Use its normal single-channel scan and exact-SSID join on
-		// either band. Avoid competing normal/P2P scan requests on this driver.
-		const bool beacon_discovery = !driver_error && driver == "brcmfmac";
-		size_t scan_index = 0, isolated_index = 0;
+		// Full-MAC native discovery can hide GOs or leave the firmware unable
+		// to accept clients after becoming an owner. Use its station beacon
+		// scans. Other drivers alternate beacon scans and native P2P discovery.
+		size_t scan_index = 0, isolated_index = 0, discovery_attempt = 0;
 		auto discover = [&](bool isolated = false) {
 			// Revisit a remembered owner/AP channel between other targets so
 			// cleanup and retry cannot lose a reachable group for a band rotation.
@@ -281,20 +303,38 @@ class WifiDirect {
 			if (!ap_present && !current_channel) {
 				++scan_index;
 			}
-			if ((created.empty() && !enrolling) || isolated) {
-				// Broadcom P2P discovery may omit a GO that a normal constrained
-				// scan can see. Refresh that BSS table on this same single channel.
-				// BUSY is harmless: an existing scan will finish first. Established
-				// groups with clients do not scan the primary station interface.
-				ap.request("SCAN freq=" + target);
-			}
-			if (!beacon_discovery) {
+			if (!full_mac && discovery_attempt++ % 2 == 0) {
 				request.ok("P2P_FIND 2 freq=" + target + " delay=10000");
+			} else if ((created.empty() && !enrolling) || isolated) {
+				// A remembered group SSID permits directed probing when firmware
+				// filters wildcard results. Never broaden the selected channel.
+				std::string directed;
+				if (proposed && proposed != config_.own && discovered.count(proposed) &&
+					discovered.at(proposed).radio.frequency == std::stoul(target)) {
+					directed = discovered.at(proposed).ssid;
+				}
+				ap.request("SCAN freq=" + target + (directed.empty() ? "" : " ssid " + directed));
 			}
 		};
-		auto observe_ap_loss = [&]() {
-			if (ap_present && !created.empty() && addressed &&
-				ap.request("STATUS").find("wpa_state=COMPLETED") == std::string::npos) {
+		auto observe_ap_change = [&]() {
+			if (created.empty() || !addressed) {
+				return;
+			}
+			const bool associated = ap.request("STATUS").find("wpa_state=COMPLETED") != std::string::npos;
+			if (!ap_present && associated) {
+				const auto current_radio = command({"iw", "dev", config_.interface, "info"});
+				if (radio_channel(current_radio) == local.radio) {
+					// Returning on the existing group channel needs no role change or
+					// new enrollment. Resume AP pinning and preserve working sessions.
+					ap_radio = current_radio;
+					ap_present = true;
+					local.ap_present = true;
+					last_ap_frequency_ = local.radio.frequency;
+					request.ok("SET model_name " + radio_model(local.radio, true));
+					publish_status();
+					RCLCPP_INFO(logger_, "AP returned on the direct group channel; retaining Wi-Fi Direct group");
+				}
+			} else if (ap_present && !associated) {
 				if (hosting && !hosting_allowed(command({"iw", "phy", phy, "channels"}), local.radio)) {
 					// A concurrent NO_IR exception needs an associated AP. Once it
 					// disappears, reform on a legal standalone channel instead.
@@ -311,6 +351,12 @@ class WifiDirect {
 			}
 		};
 		auto cleanup = [&]() {
+			if (!full_mac) {
+				try {
+					request.ok("P2P_STOP_FIND");
+				} catch (...) {
+				}
+			}
 			{
 				std::lock_guard<std::mutex> lock(mutex_);
 				group_.clear();
@@ -356,7 +402,7 @@ class WifiDirect {
 			auto next_join = Clock::time_point{};
 			auto next_check = Clock::now() + 5s;
 			auto next_peer_check = Clock::now() + 2s;
-			auto next_isolated_scan = Clock::now() + 150s;
+			auto next_isolated_scan = Clock::now() + 5s;
 			// Joining is allowed only after a fresh beacon identified a formed GO,
 			// never merely a similarly named idle device or a stale cached address.
 			auto join_owner = [&](const DiscoveredOwner& peer) {
@@ -384,6 +430,9 @@ class WifiDirect {
 				if (!peer.ssid.empty()) {
 					options += " ssid=" + peer.ssid;
 				}
+				if (!full_mac) {
+					request.ok("P2P_STOP_FIND");
+				}
 				request.ok("P2P_CONNECT " + peer.device + " pbc join" + options);
 				enrolling = true;
 				local.owner = owner;
@@ -396,24 +445,16 @@ class WifiDirect {
 			auto refresh_peers = [&]() {
 				const std::optional<RadioChannel> pinned =
 					ap_present ? std::optional<RadioChannel>(local.radio) : std::nullopt;
-				FleetPeers authenticated;
-				{
-					std::lock_guard<std::mutex> lock(mutex_);
-					authenticated = peers_;
-				}
 				NearbyUavs nearby;
 				for (const auto& [peer, observation] : discover_owners(request, ap, config_, pinned, nearby)) {
 					const auto failed = failed_groups_.find(peer);
 					if (failed != failed_groups_.end()) {
-						const auto report = authenticated.find(peer);
-						const bool alive = report != authenticated.end() &&
-							Clock::now() - report->second.seen <= std::chrono::seconds(config_.peer_timeout);
-						// Supplicant can keep beaconing after its ROS owner was killed.
-						// Retry when the application is heard again or it forms a new
-						// group. This gives another live UAV a chance to become owner.
-						if (!alive &&
-							(failed->second.empty() || observation.ssid.empty() ||
-								failed->second == observation.ssid)) {
+						// A live application does not prove that its group can be joined.
+						// Give an alternative owner time to form; a fresh SSID or the
+						// cooldown expiry permits another attempt at this owner.
+						if (Clock::now() < failed->second.second &&
+							(failed->second.first.empty() || observation.ssid.empty() ||
+								failed->second.first == observation.ssid)) {
 							discovered.erase(peer);
 							continue;
 						}
@@ -440,15 +481,33 @@ class WifiDirect {
 			};
 			while (!stop_) {
 				if (!created.empty() && !addressed) {
-					// Wait for the existing network manager to assign the P2P address.
+					if (!address_requested) {
+						const auto state = group_control->request("STATUS");
+						// Routers can start before this node. Keep their IP traffic off
+						// the temporary WPS association until WPA2 is fully established.
+						if (state.find("wpa_state=COMPLETED\n") != std::string::npos &&
+							(state.find("key_mgmt=WPA2-PSK\n") != std::string::npos ||
+								state.find("key_mgmt=WPA-PSK\n") != std::string::npos)) {
+							config_.p2p_subnet.activate(config_.own);
+							address_requested = true;
+						}
+					}
+					// The existing network manager applies the address to the completed group.
 					const auto network = interface_network(created);
-					addressed = static_cast<bool>(network);
+					addressed = address_requested && static_cast<bool>(network);
 					if (addressed) {
+						if (!config_.p2p_subnet.matches(network, config_.own)) {
+							throw std::runtime_error(
+								"P2P address differs from network.p2p_subnet; reinstall the support package");
+						}
 						for (const auto peer : config_.numbers) {
 							network.peer_address(config_.own, peer);
 						}
 						RCLCPP_INFO(logger_, "Using host-configured P2P address %s on %s", network.address.c_str(),
 							created.c_str());
+						std::lock_guard<std::mutex> lock(mutex_);
+						group_ = created;
+						owner_lease = Clock::now() + std::chrono::seconds(std::max(config_.peer_timeout, 12));
 					}
 					local.ready = addressed;
 					publish_status();
@@ -494,7 +553,7 @@ class WifiDirect {
 				if (ap_event.find("CTRL-EVENT-DISCONNECTED") != std::string::npos ||
 					ap_event.find("CTRL-EVENT-CONNECTED") != std::string::npos ||
 					ap_event.find("CTRL-EVENT-ASSOC-REJECT") != std::string::npos) {
-					observe_ap_loss();
+					observe_ap_change();
 					const auto current = ap.request("STATUS");
 					if ((current.find("wpa_state=COMPLETED") != std::string::npos) != ap_present) {
 						throw std::runtime_error("AP availability changed; updating this node's P2P channel policy");
@@ -555,10 +614,6 @@ class WifiDirect {
 						RCLCPP_WARN(logger_, "P2P power-saving control unsupported; retaining the driver default on %s",
 							created.c_str());
 					}
-					{
-						std::lock_guard<std::mutex> lock(mutex_);
-						group_ = created;
-					}
 					local.role = hosting ? FleetRole::hosting : FleetRole::client;
 					local.owner = owner;
 					local.ready = false;
@@ -569,7 +624,9 @@ class WifiDirect {
 					RCLCPP_INFO(logger_, "Wi-Fi Direct %s on %s, frequency %s MHz; waiting for host-configured IPv4",
 						hosting ? "group owner" : "client", created.c_str(), frequency.c_str());
 					if (hosting) {
-						next_isolated_scan = Clock::now() + (ap_present ? 150s : 30s);
+						// Full-MAC owners need an uninterrupted enrollment window.
+						// Other radios can find and merge their empty groups meanwhile.
+						next_isolated_scan = Clock::now() + (full_mac ? 150s : 5s);
 						group_control->ok("WPS_PBC");
 						next_pbc = Clock::now() + 120s;
 						// A short same-channel discovery initializes GO discovery state on
@@ -603,20 +660,26 @@ class WifiDirect {
 				if (event.find("WPS-SUCCESS") != std::string::npos && hosting) {
 					next_pbc = Clock::now() + 5s;
 				}
-				if (event.find("P2P-PROV-DISC-PBC-REQ") != std::string::npos && group_control && hosting &&
-					Clock::now() >= next_pbc) {
-					// Keep active WPS unchanged while the peer associates. Refresh only
-					// an expired/completed window requested by a configured UAV.
+				if (event.find("P2P-PROV-DISC-PBC-REQ") != std::string::npos && group_control && hosting) {
+					// Provisioning precedes STA-FIRST visibility. Stop discovery now,
+					// even when the existing WPS window is still open, and reserve the
+					// radio for enrollment. Associated stations subsequently suppress scans.
 					std::smatch peer_name;
 					if (std::regex_search(event, peer_name, std::regex("name='(uav[0-9]{1,2})'")) &&
 						config_.numbers.count(std::stoi(std::string(peer_name[1]).substr(3)))) {
 						next_isolated_scan = Clock::now() + 150s;
-						group_control->ok("WPS_PBC");
-						next_pbc = Clock::now() + 120s;
+						enrollment_until = Clock::now() + 30s;
+						if (!full_mac) {
+							request.ok("P2P_STOP_FIND");
+						}
+						if (Clock::now() >= next_pbc) {
+							group_control->ok("WPS_PBC");
+							next_pbc = Clock::now() + 120s;
+						}
 					}
 				}
 				if (Clock::now() >= next_check) {
-					observe_ap_loss();
+					observe_ap_change();
 					status = ap.request("STATUS");
 					const bool associated = status.find("wpa_state=COMPLETED") != std::string::npos;
 					if (associated != ap_present ||
@@ -644,6 +707,31 @@ class WifiDirect {
 					reports = peers_;
 				}
 				const auto now = Clock::now();
+				// Some radios cannot receive another band's beacons while hosting.
+				// Two empty groups can then remain invisible to one another. Release
+				// an unused standalone group periodically so normal discovery can run
+				// with no GO channel context. Keep clients and WPS enrollment intact.
+				if (hosting && addressed && !ap_present && local.members == 1 && config_.numbers.size() > 1) {
+					const auto station = group_control->request("STA-FIRST");
+					if (now < enrollment_until ||
+						std::regex_search(station, std::regex("^[0-9A-Fa-f:]{17}(?:\\n|$)"))) {
+						empty_group_since = now;
+					} else if (now - empty_group_since >= (full_mac ? 150s : 30s)) {
+						host_retry_ = now + std::chrono::seconds(config_.host_cooldown);
+						RCLCPP_INFO(logger_, "Empty standalone Wi-Fi Direct group restarting discovery");
+						break;
+					}
+				} else {
+					empty_group_since = now;
+				}
+				for (const auto& [peer, failure] : failed_groups_) {
+					const auto report = reports.find(peer);
+					if (now < failure.second && report != reports.end() &&
+						report->second.status.role == FleetRole::hosting) {
+						// AP heartbeats may remain healthy while P2P enrollment fails.
+						reports.erase(report);
+					}
+				}
 				if (hosting && group_control && now >= next_pbc) {
 					// Explicit BSSID joins need not send provisioning discovery.
 					// Renew an expired enrollment window so late/returning UAVs can
@@ -676,11 +764,11 @@ class WifiDirect {
 				int selected = elect_owner(
 					config_.own, local, reports, discovered, now, std::chrono::seconds(config_.peer_timeout));
 				int alternative = 0;
-				if (hosting && addressed && !ap_present && local.members == 1 && selected == config_.own) {
+				if (hosting && addressed && local.members == 1 && selected == config_.own) {
 					for (const auto& [peer, hint] : discovered) {
 						// Preserve the observation across alternating isolated scans;
 						// require a newly refreshed beacon before actually yielding.
-						if (now - hint.seen <= std::chrono::seconds(std::max(45, config_.peer_timeout))) {
+						if (now - hint.seen <= std::chrono::seconds(std::max(30, config_.peer_timeout))) {
 							alternative = peer;
 							break;
 						}
@@ -692,17 +780,21 @@ class WifiDirect {
 				}
 				if (isolated_peer && now - discovered.at(isolated_peer).seen <= 3s &&
 					now - isolated_since >=
-						std::chrono::seconds(std::max(30, config_.peer_timeout + 3 * config_.switch_hold))) {
+						std::chrono::seconds(std::max(10, config_.peer_timeout + 2 * config_.switch_hold))) {
 					// Discovery can be asymmetric: one isolated GO may hear another
 					// whose Full-MAC firmware never discovers it. Give the normal
 					// identity election time to converge first, then yield an empty
-					// standalone group so the reachable UAVs can join one group.
+					// group so the reachable UAVs can join one group. Discovery has
+					// already checked compatibility with our primary AP channel.
 					// An associated/enrolling station always takes precedence.
 					const auto station = group_control->request("STA-FIRST");
-					if (!std::regex_search(station, std::regex("^[0-9A-Fa-f:]{17}(?:\\n|$)"))) {
+					if (now >= enrollment_until &&
+						!std::regex_search(station, std::regex("^[0-9A-Fa-f:]{17}(?:\\n|$)"))) {
 						last_owner_frequency_ = discovered.at(isolated_peer).radio.frequency;
 						host_retry_ = now + std::chrono::seconds(config_.host_cooldown);
-						throw std::runtime_error("Isolated standalone group yielding to a reachable fleet owner");
+						RCLCPP_INFO(logger_, "Empty Wi-Fi Direct group yielding to reachable owner %s",
+							config_.name(isolated_peer).c_str());
+						break;
 					}
 					isolated_since = now;
 				}
@@ -712,7 +804,7 @@ class WifiDirect {
 					selected = owner;
 				}
 				if (!hosting && !created.empty() && now >= owner_lease) {
-					failed_groups_[owner] = joining_owner.ssid;
+					failed_groups_[owner] = {joining_owner.ssid, now + std::chrono::seconds(config_.host_cooldown)};
 					throw std::runtime_error("Fleet owner heartbeat expired; re-electing");
 				}
 				if (selected != proposed) {
@@ -724,12 +816,12 @@ class WifiDirect {
 						next_scan = std::min(next_scan, now + std::chrono::seconds(config_.switch_hold));
 					}
 				}
-				if (!enrolling && now >= settle_until &&
-					now - proposal_since >= std::chrono::seconds(config_.switch_hold)) {
+				if (!enrolling && now - proposal_since >= std::chrono::seconds(config_.switch_hold)) {
 					if (!created.empty() && selected && selected != owner) {
 						if (hosting && group_control && local.members == 1 &&
-							std::regex_search(
-								group_control->request("STA-FIRST"), std::regex("^[0-9A-Fa-f:]{17}(?:\\n|$)"))) {
+							(now < enrollment_until ||
+								std::regex_search(
+									group_control->request("STA-FIRST"), std::regex("^[0-9A-Fa-f:]{17}(?:\\n|$)")))) {
 							// An enrolling station is not an authenticated member yet.
 							// Let its WPS/TLS attempt finish before merging empty groups.
 							proposal_since = now;
@@ -746,7 +838,7 @@ class WifiDirect {
 					}
 					if (created.empty()) {
 						owner = selected;
-						if (!hosting && owner == config_.own && local.can_host) {
+						if (!hosting && owner == config_.own && local.can_host && now >= settle_until) {
 							hosting = true;
 							local.role = FleetRole::hosting;
 							local.owner = owner;
@@ -771,21 +863,18 @@ class WifiDirect {
 				if (hosting && created.empty() && now >= address_deadline) {
 					throw std::runtime_error("Elected owner failed to form a group");
 				}
-				// Established groups stay scan-free. An isolated GO may discover other
-				// groups after a long enrollment quiet period, but only with no associated
-				// stations and no authenticated direct peers. This permits native startup
-				// convergence when AP transport is disabled, without disturbing clients.
+				// Empty groups continue discovery until a client arrives. An AP control
+				// connection alone must not suppress the scans needed for a direct link.
+				// Associated/enrolling stations and authenticated members keep their GO
+				// scan-free. Every AP-associated scan stays on the primary channel.
 				if (hosting && group_control && now >= next_isolated_scan) {
 					const auto station = group_control->request("STA-FIRST");
 					const bool clients = std::regex_search(station, std::regex("^[0-9A-Fa-f:]{17}(?:\\n|$)"));
-					const bool live_peers = std::any_of(reports.begin(), reports.end(), [&](const auto& peer) {
-						return now - peer.second.seen <= std::chrono::seconds(config_.peer_timeout);
-					});
-					if (!clients && !live_peers) {
+					if (!clients && local.members == 1) {
 						discover(true);
 						refresh_peers();
 					}
-					next_isolated_scan = now + (ap_present ? 30s : 10s);
+					next_isolated_scan = now + (ap_present ? 5s : 10s);
 				}
 				if (!hosting && created.empty() && !enrolling && now >= next_scan) {
 					discover();
@@ -797,6 +886,10 @@ class WifiDirect {
 				}
 			}
 		} catch (...) {
+			if (enrolling && owner && owner != config_.own) {
+				failed_groups_[owner] = {
+					joining_owner.ssid, Clock::now() + std::chrono::seconds(config_.host_cooldown)};
+			}
 			if (hosting && !addressed) {
 				host_retry_ = Clock::now() + std::chrono::seconds(config_.host_cooldown);
 				local.can_host = false;
@@ -814,7 +907,8 @@ class WifiDirect {
 	NearbyUavs nearby_;
 	FleetStatus fleet_status_;
 	FleetPeers peers_;
-	std::map<int, std::string> failed_groups_;
+	// Retry an unresponsive group after cooldown even if its SSID is unchanged.
+	std::map<int, std::pair<std::string, Clock::time_point>> failed_groups_;
 	RadioChannel cooldown_radio_;
 	// Retain the reachable owner's channel across cleanup and retry backoff.
 	uint32_t last_ap_frequency_{}, last_owner_frequency_{};
