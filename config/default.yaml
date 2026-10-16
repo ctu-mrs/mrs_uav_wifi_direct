@@ -99,22 +99,22 @@ wifi_direct:
   # Allowed: "" or an existing, addressed P2P interface name.
   existing_group_interface: ""
 
-# Parent path for received topics: <prefix>/<sending UAV>/<topic key>.
-# Default: ~/peers. ~ resolves to the node namespace.
+# Parent path for received topics: <prefix>/<sending UAV>/<complete topic path below its hostname>.
+# Default: ~/peers. ~ resolves to /<hostname>/wifi.
 # Allowed: a ROS topic prefix with optional {hostname};
-# "" or "/" publishes directly at /<sending UAV>/<key>.
+# "" or "/" publishes directly at /<sending UAV>/<complete topic path below its hostname>.
 peers_prefix: "~/peers"
 
 # Default in this file: the odometry entry below. Omit this list, or use [],
-# to exchange fleet status only. Allowed: up to 1024 entries with unique keys.
+# to exchange fleet status only. Allowed: up to 1024 entries with unique shared paths.
 shared_topics:
-  # Name identifying this topic on every UAV. Default example: odometry; required.
-  # Allowed: a letter or underscore, then letters, digits or underscores; up to 1024 characters.
-  - key: odometry
-    # Local source topic. Default example: /{hostname}/estimation_manager/odom_main; required.
-    # Allowed: a valid ROS topic path distinct from received topics; {hostname} expands,
-    # and ~ denotes /<hostname>/wifi.
-    topic: "/{hostname}/estimation_manager/odom_main"
+  # Local source topic and shared identity. Default example: /{hostname}/estimation_manager/odom_main; required.
+  # Allowed: a valid ROS topic path distinct from received topics, up to 1024 characters
+  # including its hostname scope. {hostname} expands, and ~ denotes /<hostname>/wifi.
+  # The shared path starts with /<hostname>; it is added when absent on the source.
+  # Peers use the same path below their own hostnames and a matching message_type.
+  # For example, /camera/image is imported as <peers_prefix>/<sending UAV>/camera/image.
+  - topic: "/{hostname}/estimation_manager/odom_main"
     # ROS message type. Default example: nav_msgs/msg/Odometry; required.
     # Allowed: an installed package/msg/Type name, up to 1024 characters.
     message_type: "nav_msgs/msg/Odometry"

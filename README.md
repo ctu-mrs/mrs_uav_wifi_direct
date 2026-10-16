@@ -33,8 +33,7 @@ The default shared topic is odometry. Add other topics under `shared_topics` as 
 
 ```yaml
 shared_topics:
-  - key: odometry
-    topic: "/{hostname}/estimation_manager/odom_main"
+  - topic: "/{hostname}/estimation_manager/odom_main"
     message_type: "nav_msgs/msg/Odometry"
     rate_hz: 10.0
     reliability: "best_effort"

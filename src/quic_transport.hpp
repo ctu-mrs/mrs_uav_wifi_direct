@@ -37,7 +37,7 @@ class QuicTransport {
 	struct Stream {
 		Connection* connection{};
 		HQUIC handle{};
-		std::string key;
+		std::string path;
 		uint64_t instance{};
 		size_t pending{};
 		bool header{}, fleet{};
@@ -265,10 +265,10 @@ class QuicTransport {
 			++send_drops_;
 			for (const auto peer : config_.numbers) {
 				if (peer != config_.own) {
-					++exported_[{peer, topic.key}].drops;
+					++exported_[{peer, topic.path}].drops;
 				}
 			}
-			warn("Dropping oversized ROS message on " + topic.key);
+			warn("Dropping oversized ROS message on " + topic.path);
 			return;
 		}
 		for (const auto peer : config_.numbers) {
@@ -291,9 +291,9 @@ class QuicTransport {
 			if (!chosen) {
 				continue;
 			}
-			auto& traffic = exported_[{peer, topic.key}];
+			auto& traffic = exported_[{peer, topic.path}];
 			try {
-				auto& stream = chosen->outgoing[topic.key];
+				auto& stream = chosen->outgoing[topic.path];
 				if (!stream || !stream->handle) {
 					stream = open_stream(*chosen, topic);
 				}
@@ -518,11 +518,11 @@ class QuicTransport {
 			warn(error.what());
 		}
 	}
-	/** @brief Create a topic channel and queue its versioned sender/key/type header once. */
+	/** @brief Create a topic channel and queue its versioned sender/path/type header once. */
 	Stream* open_stream(Connection& connection, const TopicConfig& topic) {
 		auto stream = std::make_unique<Stream>();
 		stream->connection = &connection;
-		stream->key = topic.key;
+		stream->path = topic.path;
 		auto* state = stream.get();
 		check(api_->StreamOpen(
 				  connection.handle, QUIC_STREAM_OPEN_FLAG_UNIDIRECTIONAL, stream_callback, state, &state->handle),
@@ -534,16 +534,16 @@ class QuicTransport {
 			state->handle = nullptr;
 			check(status, "StreamStart");
 		}
-		std::vector<uint8_t> header{'Q', 'C', 'R', '1'};
+		std::vector<uint8_t> header{'Q', 'C', 'R', '2'};
 		append(header, config_.own, 2);
 		append(header, instance_, 8);
-		append(header, topic.key.size(), 2);
+		append(header, topic.path.size(), 2);
 		append(header, topic.type.size(), 2);
-		header.insert(header.end(), topic.key.begin(), topic.key.end());
+		header.insert(header.end(), topic.path.begin(), topic.path.end());
 		header.insert(header.end(), topic.type.begin(), topic.type.end());
 		queue(*state, std::move(header));
-		RCLCPP_INFO(logger_, "Topic channel %s -> %s over %s", topic.key.c_str(), config_.name(connection.peer).c_str(),
-			connection.direct ? "Wi-Fi Direct" : "AP");
+		RCLCPP_INFO(logger_, "Topic channel %s -> %s over %s", topic.path.c_str(),
+			config_.name(connection.peer).c_str(), connection.direct ? "Wi-Fi Direct" : "AP");
 		return state;
 	}
 	/** @brief Open the single fleet control stream with a distinct 14-byte versioned header. */
@@ -612,7 +612,7 @@ class QuicTransport {
 	bool queue(Stream& stream, std::vector<uint8_t> bytes) {
 		if (stream.pending + bytes.size() > config_.max_pending) {
 			++send_drops_;
-			warn("Dropping message: QUIC topic channel " + stream.key + " is backpressured");
+			warn("Dropping message: QUIC topic channel " + stream.path + " is backpressured");
 			return false;
 		}
 		auto* buffer = new SendBuffer{std::move(bytes), {}};
@@ -628,9 +628,9 @@ class QuicTransport {
 	}
 	/**
 	 * @brief Reassemble stream chunks into complete ROS messages, checking their sizes.
-	 * Header: QCR1, sender(u16), boot ID(u64), key/type lengths(u16), key/type bytes.
+	 * Header: QCR2, sender(u16), boot ID(u64), path/type lengths(u16), path/type bytes.
 	 * Repeated records: sequence(u64), CDR length(u32), CDR bytes. All integers are
-	 * big-endian. Unknown keys, mismatched types and invalid sizes abort this stream.
+	 * big-endian. Unconfigured paths, mismatched types and invalid sizes abort this stream.
 	 */
 	bool parse(Stream& stream) {
 		auto& bytes = stream.input;
@@ -642,25 +642,27 @@ class QuicTransport {
 			if (bytes.size() < 18) {
 				return true;
 			}
-			const size_t key_length = integer(bytes.data() + 14, 2), type_length = integer(bytes.data() + 16, 2);
-			if (std::memcmp(bytes.data(), "QCR1", 4) != 0 ||
-				integer(bytes.data() + 4, 2) != static_cast<uint64_t>(stream.connection->peer) || key_length == 0 ||
-				key_length > 1024 || type_length == 0 || type_length > 1024) {
+			const size_t path_length = integer(bytes.data() + 14, 2), type_length = integer(bytes.data() + 16, 2);
+			if (std::memcmp(bytes.data(), "QCR2", 4) != 0 ||
+				integer(bytes.data() + 4, 2) != static_cast<uint64_t>(stream.connection->peer) || path_length == 0 ||
+				path_length > 1024 || type_length == 0 || type_length > 1024) {
 				return false;
 			}
-			if (bytes.size() < 18 + key_length + type_length) {
+			if (bytes.size() < 18 + path_length + type_length) {
 				return true;
 			}
-			stream.key.assign(reinterpret_cast<const char*>(bytes.data() + 18), key_length);
-			const std::string type(reinterpret_cast<const char*>(bytes.data() + 18 + key_length), type_length);
-			const auto topic = std::find_if(config_.topics.begin(), config_.topics.end(),
-				[&](const auto& entry) { return entry.key == stream.key && entry.type == type; });
+			const std::string path(reinterpret_cast<const char*>(bytes.data() + 18), path_length);
+			const std::string type(reinterpret_cast<const char*>(bytes.data() + 18 + path_length), type_length);
+			const auto topic = std::find_if(config_.topics.begin(), config_.topics.end(), [&](const auto& entry) {
+				return config_.peer_topic(entry.path, stream.connection->peer) == path && entry.type == type;
+			});
 			if (topic == config_.topics.end()) {
 				return false;
 			}
+			stream.path = topic->path;
 			stream.instance = integer(bytes.data() + 6, 8);
 			stream.header = true;
-			bytes.erase(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(18 + key_length + type_length));
+			bytes.erase(bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(18 + path_length + type_length));
 		}
 		size_t consumed = 0;
 		while (bytes.size() - consumed >= 12) {
@@ -675,12 +677,12 @@ class QuicTransport {
 			while (receive_bytes_ + length > config_.max_pending && !received_.empty()) {
 				receive_bytes_ -= received_.front().payload.size();
 				const auto& dropped = received_.front();
-				++receive_drops_by_topic_[{dropped.peer, dropped.key}];
+				++receive_drops_by_topic_[{dropped.peer, dropped.path}];
 				received_.pop_front();
 				++receive_drops_;
 				warn("ROS receive queue full; dropping oldest pending sample");
 			}
-			Received message{stream.connection->peer, stream.instance, sequence, stream.key, {}};
+			Received message{stream.connection->peer, stream.instance, sequence, stream.path, {}};
 			message.payload.assign(bytes.begin() + static_cast<std::ptrdiff_t>(consumed + 12),
 				bytes.begin() + static_cast<std::ptrdiff_t>(consumed + 12 + length));
 			received_.push_back(std::move(message));

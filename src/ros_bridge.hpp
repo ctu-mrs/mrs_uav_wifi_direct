@@ -47,11 +47,18 @@ class WifiDirectNode : public rclcpp::Node {
 			start_status();
 			return;
 		}
-		wifi_ = std::make_unique<WifiDirect>(*config_, get_logger());
-		transport_ = std::make_unique<QuicTransport>(*config_, get_logger());
-		transport_->start();
-		for (auto configured : config_->topics) {
+		// Resolve remappings before constructing the transport. Its stream paths
+		// identify the actual subscribed topics, including the sending hostname.
+		std::map<std::string, std::string> subscription_names;
+		for (auto& configured : config_->topics) {
+			const auto source = configured.source;
 			configured.source = get_node_topics_interface()->resolve_topic_name(configured.source);
+			configured.path = scoped_topic(configured.source, config_->hostname);
+			if (configured.path.size() > 1024 || !subscription_names.emplace(configured.path, source).second) {
+				throw std::runtime_error("Invalid or duplicate shared topic after ROS remapping: " + configured.path);
+			}
+		}
+		for (const auto& configured : config_->topics) {
 			// Check actual import names: a root prefix must still allow ordinary
 			// exports, while forwarding an imported topic would create a loop.
 			for (const auto peer : config_->numbers) {
@@ -59,13 +66,18 @@ class WifiDirectNode : public rclcpp::Node {
 					continue;
 				}
 				for (const auto& received : config_->topics) {
-					const auto imported = config_->peers_prefix + "/" + config_->name(peer) + "/" + received.key;
+					const auto imported = config_->peers_prefix + config_->peer_topic(received.path, peer);
 					if (configured.source == get_node_topics_interface()->resolve_topic_name(imported)) {
 						throw std::runtime_error("Exported topic overlaps a received peer topic: " + configured.source);
 					}
 				}
 			}
-			auto& topic = topics_[configured.key];
+		}
+		wifi_ = std::make_unique<WifiDirect>(*config_, get_logger());
+		transport_ = std::make_unique<QuicTransport>(*config_, get_logger());
+		transport_->start();
+		for (const auto& configured : config_->topics) {
+			auto& topic = topics_[configured.path];
 			topic.config = configured;
 			rclcpp::SubscriptionOptions options;
 			options.ignore_local_publications = true;
@@ -79,9 +91,10 @@ class WifiDirectNode : public rclcpp::Node {
 				qos.best_effort();
 			}
 			topic.subscription = create_generic_subscription(
-				configured.source, configured.type, qos,
-				[this, key = configured.key](std::shared_ptr<rclcpp::SerializedMessage> message) {
-					auto& entry = topics_.at(key);
+				// Use the original name so ROS applies remapping exactly once.
+				subscription_names.at(configured.path), configured.type, qos,
+				[this, path = configured.path](std::shared_ptr<rclcpp::SerializedMessage> message) {
+					auto& entry = topics_.at(path);
 					++entry.source_messages;
 					entry.last_source = Clock::now();
 					if (entry.config.hz > 0) {
@@ -93,16 +106,16 @@ class WifiDirectNode : public rclcpp::Node {
 				options);
 			if (configured.hz > 0) {
 				topic.timer = create_wall_timer(std::chrono::nanoseconds(static_cast<int64_t>(1e9 / configured.hz)),
-					[this, key = configured.key]() {
-						auto& entry = topics_.at(key);
+					[this, path = configured.path]() {
+						auto& entry = topics_.at(path);
 						if (entry.pending) {
 							transport_->send(entry.config, *entry.pending, ++entry.sequence);
 							entry.pending.reset();
 						}
 					});
 			}
-			RCLCPP_INFO(get_logger(), "Sharing %s (%s), key=%s, rate_hz=%.3f", configured.source.c_str(),
-				configured.type.c_str(), configured.key.c_str(), configured.hz);
+			RCLCPP_INFO(get_logger(), "Sharing %s (%s), exported_topic=%s, rate_hz=%.3f", configured.source.c_str(),
+				configured.type.c_str(), configured.path.c_str(), configured.hz);
 		}
 		wifi_->start();
 		transport_->tick(wifi_->ready_interface());
@@ -150,8 +163,8 @@ class WifiDirectNode : public rclcpp::Node {
 				continue;
 			}
 			std::vector<msg::TopicStatus> shared;
-			for (const auto& [key, topic] : topics_) {
-				const auto id = std::make_pair(peer, key);
+			for (const auto& [path, topic] : topics_) {
+				const auto id = std::make_pair(peer, path);
 				const auto sent = transport.exported.find(id);
 				const auto traffic = sent == transport.exported.end() ? TopicTraffic{} : sent->second;
 				const auto found = topic.imports.find(peer);
@@ -159,9 +172,9 @@ class WifiDirectNode : public rclcpp::Node {
 				const auto dropped = transport.receive_drops_by_topic.find(id);
 				auto& previous = previous_discovery_[id];
 				msg::TopicStatus item;
-				item.key = key;
+				item.exported_topic = path;
 				item.source_topic = topic.config.source;
-				item.received_topic = config_->peers_prefix + "/" + config_->name(peer) + "/" + key;
+				item.received_topic = config_->peers_prefix + config_->peer_topic(path, peer);
 				item.message_type = topic.config.type;
 				item.rate_limit_hz = topic.config.hz;
 				item.source_reliable = topic.config.reliable;
@@ -223,7 +236,7 @@ class WifiDirectNode : public rclcpp::Node {
 		bool missing_source = false;
 		std::vector<std::string> definitions;
 		std::map<int, std::vector<std::string>> exports, imports;
-		for (auto& [key, topic] : topics_) {
+		for (auto& [path, topic] : topics_) {
 			const auto source_rate = rate(topic.source_messages, topic.previous_source_messages);
 			const auto publishers = topic.subscription->get_publisher_count();
 			missing_source |= publishers == 0;
@@ -231,17 +244,17 @@ class WifiDirectNode : public rclcpp::Node {
 				: !topic.source_messages			? "WAITING_DATA"
 				: source_rate > 0					? "ACTIVE"
 													: "IDLE";
-			definitions.push_back(key + "=" + topic.subscription->get_topic_name() +
-				"(limit=" + (topic.config.hz > 0 ? status_number(topic.config.hz) + "Hz" : "unlimited") +
-				",source=" + status_number(source_rate) + "Hz)");
+			definitions.push_back(path + "(source=" + topic.subscription->get_topic_name() + "," +
+				"limit=" + (topic.config.hz > 0 ? status_number(topic.config.hz) + "Hz" : "unlimited") +
+				",rate=" + status_number(source_rate) + "Hz)");
 			for (const auto peer : config_->numbers) {
 				if (peer == config_->own) {
 					continue;
 				}
-				const auto id = std::make_pair(peer, key);
+				const auto id = std::make_pair(peer, path);
 				const auto sent = transport.exported.find(id);
 				const auto traffic = sent == transport.exported.end() ? TopicTraffic{} : sent->second;
-				std::string exported = key + "=" + status_number(rate(traffic.messages, previous_exported_[id])) +
+				std::string exported = path + "=" + status_number(rate(traffic.messages, previous_exported_[id])) +
 					"Hz,drops=" + std::to_string(traffic.drops) + "," + (topic.config.reliable ? "R" : "BE");
 				if (source_rate == 0 || publishers == 0) {
 					exported += "," + std::string(source_health) + "/" + status_age(topic.last_source, now);
@@ -252,8 +265,8 @@ class WifiDirectNode : public rclcpp::Node {
 				const auto dropped = transport.receive_drops_by_topic.find(id);
 				const auto receive_drops =
 					imported.drops + (dropped == transport.receive_drops_by_topic.end() ? 0 : dropped->second);
-				std::string received =
-					key + "=" + status_number(received_rate) + "Hz,drops=" + std::to_string(receive_drops) + ",R";
+				std::string received = config_->peer_topic(path, peer) + "=" + status_number(received_rate) +
+					"Hz,drops=" + std::to_string(receive_drops) + ",R";
 				if (received_rate == 0) {
 					received +=
 						std::string(imported.messages ? ",IDLE/" : ",WAITING_DATA/") + status_age(imported.last, now);
@@ -262,7 +275,8 @@ class WifiDirectNode : public rclcpp::Node {
 			}
 		}
 		if (!config_->numbers.empty()) {
-			out << "\n  topics=" << status_list(definitions) << " receive=" << config_->peers_prefix << "/<peer>/<key>"
+			out << "\n  topics=" << status_list(definitions) << " receive=" << config_->peers_prefix
+				<< "/<peer>/<topic path>"
 				<< " | ROS QoS: R=reliable BE=best_effort; QUIC=reliable";
 		}
 		for (const auto peer : config_->numbers) {
@@ -321,7 +335,7 @@ class WifiDirectNode : public rclcpp::Node {
 	 */
 	void publish_received() {
 		for (auto& message : transport_->drain()) {
-			auto& topic = topics_.at(message.key);
+			auto& topic = topics_.at(message.path);
 			auto& imported = topic.imports[message.peer];
 			if (imported.instance == message.instance && message.sequence <= imported.sequence) {
 				continue;
@@ -329,7 +343,7 @@ class WifiDirectNode : public rclcpp::Node {
 			try {
 				auto& publisher = imported.publisher;
 				if (!publisher) {
-					const auto name = config_->peers_prefix + "/" + config_->name(message.peer) + "/" + message.key;
+					const auto name = config_->peers_prefix + config_->peer_topic(message.path, message.peer);
 					const auto resolved = get_node_topics_interface()->resolve_topic_name(name);
 					for (const auto& entry : topics_) {
 						if (resolved == entry.second.subscription->get_topic_name()) {

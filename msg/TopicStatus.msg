@@ -1,5 +1,6 @@
 # Cumulative local counters for one topic and peer, retained across reconnects.
-string key
+# Full hostname-scoped path sent over QUIC; the local source can be unscoped.
+string exported_topic
 string source_topic
 string received_topic
 string message_type

@@ -37,11 +37,12 @@ inline uint64_t integer(const uint8_t* bytes, size_t width) {
  * @brief Message buffer passed from a MsQuic worker to the ROS executor.
  * The boot instance and topic sequence distinguish reconnects and discard late or
  * duplicate samples when the sender changes between AP and direct connections.
+ * Path identifies the matching locally configured hostname-scoped topic.
  */
 struct Received {
 	int peer{};
 	uint64_t instance{}, sequence{};
-	std::string key;
+	std::string path;
 	std::vector<uint8_t> payload;
 };
 

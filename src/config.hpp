@@ -22,7 +22,7 @@
 #include "p2p_address.hpp"
 
 namespace mrs_uav_wifi_direct {
-/** @brief Check that a topic key is one valid ROS name component. */
+/** @brief Check that a hostname is one valid ROS name component. */
 inline bool token(const std::string& value) {
 	return std::regex_match(value, std::regex("[A-Za-z_][A-Za-z_0-9]*"));
 }
@@ -62,6 +62,17 @@ inline std::string expand_topic(std::string value, const std::string& hostname) 
 	return path;
 }
 
+/**
+ * @brief Give an exported topic its sending UAV's top-level namespace.
+ * The local subscription keeps its source name. Only the shared path gains the
+ * hostname when it is absent, so /camera/image becomes /<hostname>/camera/image.
+ * An exact path-component match prevents names such as uav1 and uav10 colliding.
+ */
+inline std::string scoped_topic(const std::string& source, const std::string& hostname) {
+	const auto scope = "/" + hostname;
+	return source == scope || source.compare(0, scope.size() + 1, scope + "/") == 0 ? source : scope + source;
+}
+
 /** @brief Expand hostname placeholders and the user's home directory in filesystem paths. */
 inline std::string expand_path(std::string value, const std::string& hostname) {
 	value = expand_hostname(std::move(value), hostname);
@@ -81,9 +92,13 @@ T option(const YAML::Node& node, const char* key, const T& fallback) {
 	return node && node[key] ? node[key].as<T>() : fallback;
 }
 
-/** @brief Settings for one shared topic; hz=0 sends every new sample. */
+/**
+ * @brief Settings for one shared topic; hz=0 sends every new sample.
+ * Source is the local subscription path; path is its hostname-scoped identity on
+ * the network. Peers match the complete path below their respective hostnames.
+ */
 struct TopicConfig {
-	std::string key, source, type;
+	std::string source, path, type;
 	double hz{};
 	bool reliable{};
 };
@@ -110,6 +125,11 @@ struct Config {
 	std::string name(int number) const {
 		const auto entry = names.find(number);
 		return entry == names.end() ? uav_name(number) : entry->second;
+	}
+
+	/** @brief Reconstruct a configured shared path in the sending peer's namespace. */
+	std::string peer_topic(const std::string& path, int peer) const {
+		return "/" + name(peer) + path.substr(hostname.size() + 1);
 	}
 
 	/** @brief Use a common port, or add the UAV number for multiple processes on one host. */
@@ -246,25 +266,28 @@ struct Config {
 				throw std::runtime_error("Missing explicitly configured TLS file " + file);
 			}
 		}
-		std::set<std::string> keys;
+		std::set<std::string> paths;
 		const auto shared = root["shared_topics"];
 		if (shared && !shared.IsSequence()) {
 			throw std::runtime_error("shared_topics must be a list");
 		}
 		if (shared) {
 			for (const auto& entry : shared) {
-				TopicConfig topic{entry["key"].as<std::string>(), expand_topic(entry["topic"].as<std::string>(), name),
-					entry["message_type"].as<std::string>(), option(entry, "rate_hz", 0.0)};
+				TopicConfig topic;
+				topic.source = expand_topic(entry["topic"].as<std::string>(), name);
+				topic.path = scoped_topic(topic.source, name);
+				topic.type = entry["message_type"].as<std::string>();
+				topic.hz = option(entry, "rate_hz", 0.0);
 				const auto reliability = option(entry, "reliability", std::string("best_effort"));
 				if (reliability != "best_effort" && reliability != "reliable") {
 					throw std::runtime_error("Topic reliability must be best_effort or reliable");
 				}
 				topic.reliable = reliability == "reliable";
-				if (!token(topic.key) || topic.key.size() > 1024 || !keys.insert(topic.key).second ||
-					topic.source == "/" || topic.type.empty() || topic.type.size() > 1024 || !std::isfinite(topic.hz) ||
-					topic.hz < 0 || topic.hz > 1000000 ||
+				if (!std::regex_match(topic.source, std::regex("(/[A-Za-z_][A-Za-z_0-9]*)+")) ||
+					topic.path.size() > 1024 || !paths.insert(topic.path).second || topic.type.empty() ||
+					topic.type.size() > 1024 || !std::isfinite(topic.hz) || topic.hz < 0 || topic.hz > 1000000 ||
 					(topic.hz > 0 && 1e9 / topic.hz >= static_cast<double>(std::numeric_limits<int64_t>::max()))) {
-					throw std::runtime_error("Invalid topic key, type, source or rate_hz");
+					throw std::runtime_error("Invalid or duplicate shared topic path, message_type or rate_hz");
 				}
 				topics.push_back(std::move(topic));
 			}
